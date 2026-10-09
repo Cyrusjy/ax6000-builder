@@ -262,7 +262,9 @@ jobs:
                    luci-app-eqos-mtk luci-i18n-eqos-mtk-zh-cn \
                    luci-app-turboacc-mtk luci-app-mtwifi-cfg mtwifi-cfg-ucode \
                    kmod-mt_wifi kmod-warp kmod-mediatek_hnat \
-                   kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal libbpf1; do
+                   kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal libbpf1 \
+                   sing-box luci-app-homeproxy luci-i18n-homeproxy-zh-cn \
+                   kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag; do
             if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
               log "  [y] $p"
               echo "| \`$p\` | 已启用 |" >> "$GITHUB_STEP_SUMMARY"

@@ -36,7 +36,8 @@ echo "==> 注入 eBPF 内核选项到 $KCFG"
 for sym in BPF BPF_SYSCALL BPF_JIT BPF_EVENTS CGROUP_BPF BPF_STREAM_PARSER \
            NET_CLS_BPF NET_ACT_BPF NET_CLS_ACT NET_SCH_CLSACT NET_SCH_INGRESS \
            XDP_SOCKETS XDP_SOCKETS_DIAG DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_REDUCED \
-           KPROBES KPROBE_EVENTS UPROBE_EVENTS IKCONFIG IKCONFIG_PROC; do
+           KPROBES KPROBE_EVENTS UPROBE_EVENTS IKCONFIG IKCONFIG_PROC \
+           NETLINK_DIAG NFNETLINK_QUEUE NETFILTER_XT_TARGET_NFQUEUE; do
   sed -i -E "/^#? ?CONFIG_${sym}[ =]/d" "$KCFG"
 done
 
@@ -65,6 +66,14 @@ CONFIG_KPROBE_EVENTS=y
 CONFIG_UPROBE_EVENTS=y
 CONFIG_IKCONFIG=y
 CONFIG_IKCONFIG_PROC=y
+# ===== sing-box 1.14.3 内核模块依赖（injected by ax6000-builder）=====
+# kmod-nft-queue 需要 CONFIG_NFNETLINK_QUEUE（=m 即可）
+# kmod-netlink-diag 需要 CONFIG_NETLINK_DIAG（=m 即可）
+# kmod-nfnetlink-queue 需要 CONFIG_NFNETLINK_QUEUE（=m 即可）
+# sing-box ipk 还 depends kmod-nft-queue，后者 depends kmod-nfnetlink-queue
+CONFIG_NETLINK_DIAG=m
+CONFIG_NFNETLINK_QUEUE=m
+CONFIG_NETFILTER_XT_TARGET_NFQUEUE=m
 EOF
 
 echo "==> 注入完成，$KCFG 末尾内容："
@@ -132,6 +141,26 @@ add_pkg_if_exists() {
 add_pkg_if_exists kmod-sched-bpf
 add_pkg_if_exists kmod-xdp-sockets-diag
 add_pkg_if_exists bpftool-minimal bpftool
+
+# sing-box 相关内核模块（已在 .config 里显式选了 kmod-nft-queue 等，
+# 这里只做存在性初判，最终以 defconfig 回读为准）
+echo "==> sing-box 内核模块存在性初判"
+for kmod in nft-queue nfnetlink-queue netlink-diag; do
+  if printf '%s\n' "$KPKG_LIST" | grep -qx -- "$kmod"; then
+    echo "  [+] kmod-$kmod 存在"
+  else
+    echo "  [-] kmod-$kmod 未找到 KernelPackage 定义"
+  fi
+done
+
+# sing-box 和 luci-app-homeproxy 的包存在性初判（feeds packages / luci）
+for pkg in sing-box luci-app-homeproxy luci-i18n-homeproxy-zh-cn; do
+  if find package feeds -maxdepth 5 -type d -name "$pkg" 2>/dev/null | grep -q .; then
+    echo "  [+] $pkg 存在"
+  else
+    echo "  [-] $pkg 未找到同名目录（可能包名不同或在 feeds 里）"
+  fi
+done
 
 # ----------------------------------------------------------------------------
 # 3) make defconfig —— 解析依赖、把无效项丢弃
@@ -219,6 +248,17 @@ for p in kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal bpftool libbpf1 li
     echo "  [OK]   $p"
   else
     echo "  [--]   $p  （未选中 / 包名不存在，属正常）"
+  fi
+done
+
+echo
+echo "  ---- sing-box 相关包（defconfig 后的真实状态） ----"
+for p in sing-box luci-app-homeproxy kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag; do
+  if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+    echo "  [OK]   $p"
+  else
+    echo "  [FAIL] $p  （未选中 —— 这是 sing-box 的依赖，必须生效）"
+    FAIL=1
   fi
 done
 echo "======================================================"

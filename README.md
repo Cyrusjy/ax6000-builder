@@ -261,7 +261,9 @@ sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_en
 2. **不要在开启 HNAT 的同时用主线 flow offloading**，两者抢硬件加速。
    本配置里 `CONFIG_PACKAGE_TURBOACC_INCLUDE_FLOW_OFFLOADING` 已关。
 3. **私有仓库 Actions 额度**：一次编译约 100–160 分钟，私有仓每月 2000 分钟（约 12 次）。
-4. 第二次编译命中 `dl/` 和 ccache 缓存，会明显快；改配置重编不必有心理负担。
+4. **缓存的真实生效情况**：`dl/` 源码包缓存（约 1.1GB）从第二次运行起就已命中，能省掉十几分钟下载。
+   ccache 因为路径写错过（见变更记录 #11），**第一次真正生效要等到第四次运行**——
+   第三次运行会从头编译并在结束存下缓存。改配置重编不必有心理负担，但别指望第三次就变快。
 5. 编译成功 ≠ 一定刷得进去。刷之前先把 `initramfs-kernel.bin` 和原厂分区备份留在手上。
 
 ---
@@ -281,6 +283,21 @@ files/etc/uci-defaults/99-ax6000-custom   首次启动脚本（主机名/时区/
 ---
 
 ## 八、变更记录
+
+### 2026-10-09 第三次编译前的修复（缓存顺序 bug 导致第二次编译 3 分钟即失败）
+
+第二次运行（run `37946575159`）在**第 8 步「克隆源码」就挂了**，退出码 128，总共只跑了 3 分钟，
+前面 7 步全绿。这不是上游仓库的问题（仓库和 `25.12` 分支都正常），
+而是**流水线自己的步骤顺序错**：
+
+| # | 问题 | 机理 | 修复 |
+| --- | --- | --- | --- |
+| 10 | **`dl/` 缓存恢复排在 `git clone` 之前** | 首次运行结束时存下了 `dl-…-1`（1.1GB）缓存。第二次运行时 `actions/cache` 按 `restore-keys: dl-` 命中并把内容解到 `immortalwrt/dl/` —— 于是 `immortalwrt/` 这个目录被**提前创建出来**。紧接着 `git clone … immortalwrt` 直接报 `fatal: destination path 'immortalwrt' already exists and is not an empty directory`，**exit 128**。诡异之处在于：**首次运行（无缓存）必然成功，第二次（有缓存）必然失败** | 把两个缓存步骤整体挪到克隆**之后**（缓存恢复时源码树已就位，解压只是往里填东西，不会再破坏 clone），克隆前先 `rm -rf immortalwrt` 清场，并加了 5 次重试 |
+| 11 | **ccache 缓存路径写错** —— 写成 `~/.ccache` | 上游 `rules.mk` 第 354 行把 `CCACHE_DIR` 固定为 `$(TOPDIR)/.ccache`，即 `immortalwrt/.ccache`；`$HOME/.ccache` 里**始终是空的**。所以「已缓存 ccache」是假象：每次都是 0 字节，编译加速完全没生效 | 缓存路径改为 `immortalwrt/.ccache`，键里带上源码 commit；并加 `CCACHE_MAXSIZE=2G` 限制体积（仓库缓存配额只有 10GB，不限制会挤掉 `dl/`） |
+| 12 | **克隆失败没有重试** | Azure runner 到 github.com 偶发抖动时，一次失败就整轮报废 | 克隆改为最多 5 次重试（退避 10/20/30/40s），失败才 `exit 1`；`git clone` 前先清目录，避免残留干扰 |
+
+**教训**：缓存步骤的位置是**有副作用的**。`actions/cache` 的 `path` 只写「某个子目录」时，
+它会把父目录一并创建出来，从而破坏后续「往这个父目录里 clone」的步骤。
 
 ### 2026-10-09 第二次编译前的修复（基于首次编译的实编产物核验）
 

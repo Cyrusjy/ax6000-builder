@@ -43,6 +43,9 @@ permissions:
 env:
   TZ: Asia/Shanghai
   SOURCE_DIR: immortalwrt
+  # ccache 目录由上游 rules.mk 固定在 $(TOPDIR)/.ccache，这里只限制它的大小，
+  # 免得单个缓存条目撑爆 GitHub 仓库 10GB 的缓存配额（会挤掉 dl/ 缓存）
+  CCACHE_MAXSIZE: 2G
 
 jobs:
   build:
@@ -93,38 +96,76 @@ jobs:
           ccache --version
 
       # ------------------------------------------------------------------
-      # 2. 缓存（dl 源码包 + ccache）：首次构建无缓存，之后明显加速
+      # 2. 克隆上游源码（浅克隆，只取一个分支）
+      #
+      #    ⚠️ 顺序很重要：这一步必须在「恢复 dl/ 与 .ccache 缓存」之前！
+      #    缓存恢复会把 immortalwrt/ 目录提前创建出来，
+      #    随后 git clone 会因「目标目录已存在且非空」直接 exit 128 失败。
+      #    （第 2 次运行就是这么挂的，见 README 变更记录）
       # ------------------------------------------------------------------
-      - name: 缓存 ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ hashFiles('builder/config/ax6000-mtkuboot.config') }}-${{ github.run_number }}
-          restore-keys: |
-            ccache-
+      - name: 克隆源码 ${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}@${{ github.event.inputs.source_ref || '25.12' }}
+        id: clone
+        run: |
+          SRC_REPO="${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}"
+          SRC_REF="${{ github.event.inputs.source_ref || '25.12' }}"
+          SRC_URL="https://github.com/${SRC_REPO}.git"
 
+          # 清掉任何残留（含缓存步骤万一提前创建的目录）
+          rm -rf "$SOURCE_DIR"
+
+          ok=0
+          for i in 1 2 3 4 5; do
+            echo "==> 第 $i 次尝试（共 5 次）"
+            rm -rf "$SOURCE_DIR"
+            if git clone -q --depth=1 --single-branch --branch "$SRC_REF" "$SRC_URL" "$SOURCE_DIR"; then
+              ok=1
+              break
+            fi
+            echo "::warning::第 $i 次克隆失败，$((i*10))s 后重试"
+            sleep $((i*10))
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::源码克隆失败（已重试 5 次）：$SRC_URL @ $SRC_REF"
+            exit 1
+          fi
+
+          cd "$SOURCE_DIR"
+          # 预建目录，避免 actions/cache 报 "Path Validation Error"
+          mkdir -p dl .ccache
+
+          SHORT="$(git rev-parse --short HEAD)"
+          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_COMMIT_SHORT=$SHORT" >> "$GITHUB_ENV"
+          echo "sha=$SHORT" >> "$GITHUB_OUTPUT"
+          git log -1 --format='源码 commit: %H%n日期: %ci%n说明: %s'
+          df -h /
+
+      # ------------------------------------------------------------------
+      # 3. 缓存（dl 源码包 + ccache）
+      #
+      #    ⚠️ 必须放在克隆之后：恢复缓存会创建 immortalwrt/ 目录，
+      #    放在克隆前会让 git clone 以 exit 128 失败。
+      #    ⚠️ ccache 目录是 $(TOPDIR)/.ccache，即 immortalwrt/.ccache
+      #    （上游 rules.mk 第 354 行），不是 $HOME/.ccache ——
+      #    路径写错会导致缓存永远是 0 字节。
+      # ------------------------------------------------------------------
       - name: 缓存源码包 dl/
         uses: actions/cache@v4
         with:
           path: immortalwrt/dl
-          key: dl-${{ hashFiles('builder/config/ax6000-mtkuboot.config') }}-${{ github.run_number }}
+          key: dl-${{ steps.clone.outputs.sha }}-${{ hashFiles('builder/config/ax6000-mtkuboot.config') }}
           restore-keys: |
+            dl-${{ steps.clone.outputs.sha }}-
             dl-
 
-      # ------------------------------------------------------------------
-      # 3. 克隆上游源码（浅克隆，只取一个分支）
-      # ------------------------------------------------------------------
-      - name: 克隆源码 ${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}@${{ github.event.inputs.source_ref || '25.12' }}
-        run: |
-          git clone --depth=1 \
-            --branch "${{ github.event.inputs.source_ref || '25.12' }}" \
-            "https://github.com/${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}.git" \
-            "$SOURCE_DIR"
-          cd "$SOURCE_DIR"
-          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "SOURCE_COMMIT_SHORT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          git log -1 --format='源码 commit: %H%n日期: %ci%n说明: %s'
-          df -h /
+      - name: 缓存 ccache
+        uses: actions/cache@v4
+        with:
+          path: immortalwrt/.ccache
+          key: ccache-${{ steps.clone.outputs.sha }}-${{ github.run_number }}
+          restore-keys: |
+            ccache-${{ steps.clone.outputs.sha }}-
+            ccache-
 
       # ------------------------------------------------------------------
       # 4. feeds

@@ -1,0 +1,324 @@
+name: Build Redmi AX6000 Firmware
+
+# ============================================================================
+#  红米 AX6000（Xiaomi Redmi Router AX6000 / RB06，MT7986A）固件云编译
+#  源码：chasey-dev/immortalwrt-mt798x-rebase（ImmortalWrt 25.12 + MTK OpenWrt Feeds 补丁）
+#  特点：MTK 原厂闭源 WiFi 驱动 + HNAT/WARP 硬件加速 + eBPF/BTF 内核能力
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源码仓库 (owner/repo)'
+        required: true
+        default: 'chasey-dev/immortalwrt-mt798x-rebase'
+      source_ref:
+        description: '源码分支 / 标签'
+        required: true
+        default: '25.12'
+      profile:
+        description: '设备 profile（必须和路由器当前的 U-Boot 布局一致）'
+        type: choice
+        options:
+          - xiaomi_redmi-router-ax6000-mtkuboot
+          - xiaomi_redmi-router-ax6000-ubootmod
+          - xiaomi_redmi-router-ax6000-stock
+        default: xiaomi_redmi-router-ax6000-mtkuboot
+      make_jobs:
+        description: '编译并行度（留空 = 自动使用 CPU 核数）'
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-ax6000.yml'
+      - 'config/**'
+      - 'scripts/**'
+      - 'files/**'
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Shanghai
+  SOURCE_DIR: immortalwrt
+
+jobs:
+  build:
+    name: Build (${{ github.event.inputs.profile || 'xiaomi_redmi-router-ax6000-mtkuboot' }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+
+    steps:
+      # ------------------------------------------------------------------
+      # 0. 释放磁盘空间：GitHub 免费 runner 只有 ~14GB 可用，
+      #    OpenWrt 全量编译需要 25-35GB，这一步是必须的
+      # ------------------------------------------------------------------
+      - name: 释放磁盘空间
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - name: 显示可用空间
+        run: df -h /
+
+      # ------------------------------------------------------------------
+      # 1. 检出本仓库（只放配置和脚本，不放源码）
+      # ------------------------------------------------------------------
+      - name: 检出编译器仓库
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex \
+            g++ g++-multilib gawk gcc-multilib gettext git gperf haveged help2man intltool \
+            lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip \
+            p7zip-full patch pkgconf python3 python3-docutils python3-pip python3-ply \
+            python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig \
+            texinfo uglifyjs unzip upx-ucl vim wget xmlto xxd zlib1g-dev zstd
+          ccache --version
+
+      # ------------------------------------------------------------------
+      # 2. 缓存（dl 源码包 + ccache）：首次构建无缓存，之后明显加速
+      # ------------------------------------------------------------------
+      - name: 缓存 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ hashFiles('builder/config/ax6000-mtkuboot.config') }}-${{ github.run_number }}
+          restore-keys: |
+            ccache-
+
+      - name: 缓存源码包 dl/
+        uses: actions/cache@v4
+        with:
+          path: immortalwrt/dl
+          key: dl-${{ hashFiles('builder/config/ax6000-mtkuboot.config') }}-${{ github.run_number }}
+          restore-keys: |
+            dl-
+
+      # ------------------------------------------------------------------
+      # 3. 克隆上游源码（浅克隆，只取一个分支）
+      # ------------------------------------------------------------------
+      - name: 克隆源码 ${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}@${{ github.event.inputs.source_ref || '25.12' }}
+        run: |
+          git clone --depth=1 \
+            --branch "${{ github.event.inputs.source_ref || '25.12' }}" \
+            "https://github.com/${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}.git" \
+            "$SOURCE_DIR"
+          cd "$SOURCE_DIR"
+          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_COMMIT_SHORT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          git log -1 --format='源码 commit: %H%n日期: %ci%n说明: %s'
+          df -h /
+
+      # ------------------------------------------------------------------
+      # 4. feeds
+      # ------------------------------------------------------------------
+      - name: 更新并安装 feeds
+        run: |
+          cd "$SOURCE_DIR"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 定制脚本 part1（feeds / 包调整）
+        run: |
+          chmod +x builder/scripts/*.sh
+          cd "$SOURCE_DIR"
+          bash ../builder/scripts/diy-part1.sh
+
+      # ------------------------------------------------------------------
+      # 5. 应用 .config 并校验 profile
+      # ------------------------------------------------------------------
+      - name: 应用配置并 defconfig
+        id: config
+        run: |
+          cd "$SOURCE_DIR"
+          PROFILE="${{ github.event.inputs.profile || 'xiaomi_redmi-router-ax6000-mtkuboot' }}"
+          echo "PROFILE=$PROFILE" >> "$GITHUB_ENV"
+          cp ../builder/config/ax6000-mtkuboot.config .config
+
+          # 若选择的不是默认 profile，则替换设备选项
+          if [ "$PROFILE" != "xiaomi_redmi-router-ax6000-mtkuboot" ]; then
+            sed -i \
+              -e "s|^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_xiaomi_redmi-router-ax6000-mtkuboot=y|# CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_xiaomi_redmi-router-ax6000-mtkuboot is not set|" \
+              -e "/^CONFIG_TARGET_DEVICE_PACKAGES_mediatek_filogic_DEVICE_xiaomi_redmi-router-ax6000-mtkuboot=/d" \
+              .config
+            echo "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${PROFILE}=y" >> .config
+            echo "CONFIG_TARGET_DEVICE_PACKAGES_mediatek_filogic_DEVICE_${PROFILE}=\"\"" >> .config
+          fi
+
+          make defconfig
+
+          # --- 关键校验：profile 必须真实存在，否则会白编 3 小时 ---
+          if ! grep -q "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${PROFILE}=y" .config; then
+            echo "::error::profile ${PROFILE} 在当前源码中不存在！"
+            echo "---- 源码里实际提供的 AX6000 相关 profile ----"
+            grep -oE 'DEVICE_xiaomi_redmi-router-ax6000[a-z0-9_-]*' target/linux/mediatek/image/filogic.mk | sort -u || true
+            echo "---- 源码里所有 xiaomi 设备 ----"
+            grep -oE 'DEVICE_xiaomi_[a-z0-9_-]+' target/linux/mediatek/image/filogic.mk | sort -u || true
+            exit 1
+          fi
+          echo "✅ profile ${PROFILE} 已启用"
+
+      # ------------------------------------------------------------------
+      # 6. 定制脚本 part2（eBPF 内核选项注入等）+ 自定义文件覆盖层
+      # ------------------------------------------------------------------
+      - name: 定制脚本 part2（内核 eBPF / 品牌 / 文件覆盖层）
+        run: |
+          cd "$SOURCE_DIR"
+          bash ../builder/scripts/diy-part2.sh
+          if [ -d ../builder/files ]; then
+            cp -rf ../builder/files/* .
+          fi
+          chmod +x files/etc/uci-defaults/* 2>/dev/null || true
+          make defconfig
+
+      - name: 打印最终关键配置
+        run: |
+          cd "$SOURCE_DIR"
+          echo "===== 设备 / 镜像 ====="
+          grep -E '^CONFIG_TARGET_(MULTI_PROFILE|PER_DEVICE_ROOTFS|ROOTFS_SQUASHFS)|^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' .config || true
+          echo "===== 用户要求的插件是否生效 ====="
+          for p in smartdns luci-app-smartdns luci-i18n-smartdns-zh-cn luci-app-eqos-mtk \
+                   kmod-sched-bpf kmod-xdp-sockets-diag tc-bpf bpftool bpftool-full \
+                   kmod-mt_wifi kmod-mediatek_hnat luci-app-mturboacc-mtk luci-app-turboacc-mtk; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then echo "  [y] $p"; else echo "  [ ] $p  (不存在或未选中)"; fi
+          done
+          echo "===== 内核 eBPF 选项 ====="
+          grep -E '^CONFIG_KERNEL_(DEBUG_INFO|DEBUG_INFO_BTF|DEBUG_INFO_REDUCED|BPF_EVENTS|CGROUP_BPF|XDP_SOCKETS|KPROBES|KALLSYMS)' .config || true
+          echo "===== 选中包总数 ====="
+          grep -cE '^CONFIG_PACKAGE_.*=y' .config
+
+      # ------------------------------------------------------------------
+      # 7. 预下载 + 编译
+      # ------------------------------------------------------------------
+      - name: 预下载源码包
+        run: |
+          cd "$SOURCE_DIR"
+          make -j8 download V=s || echo "::warning::部分源码包下载失败，编译阶段会自动重试"
+
+      - name: 编译固件
+        run: |
+          cd "$SOURCE_DIR"
+          JOBS="${{ github.event.inputs.make_jobs }}"
+          if [ -z "$JOBS" ]; then JOBS="$(nproc)"; fi
+          echo "并行度: $JOBS"
+          date
+          make -j"$JOBS"
+          date
+
+      - name: 编译失败时输出错误日志
+        if: failure()
+        run: |
+          cd "$SOURCE_DIR" || true
+          echo "===== logs/ 最近的日志文件 ====="
+          ls -lt logs/ 2>/dev/null | head -20 || true
+          echo "===== 报错片段 ====="
+          grep -rn -i -E "error:|Error [0-9]+|\*\*\* \[" logs/ 2>/dev/null | tail -80 || true
+
+      # ------------------------------------------------------------------
+      # 8. 校验内核 eBPF 是否真的打开（.config 里写了不等于编译进内核）
+      # ------------------------------------------------------------------
+      - name: 校验内核 eBPF / BTF 实际状态
+        run: |
+          cd "$SOURCE_DIR"
+          KCFG="$(ls build_dir/target-*/linux-*/.config 2>/dev/null | head -1)"
+          echo "内核配置文件: $KCFG"
+          grep -E '^CONFIG_(BPF|BPF_SYSCALL|BPF_JIT|BPF_EVENTS|CGROUP_BPF|NET_CLS_BPF|NET_ACT_BPF|XDP_SOCKETS|DEBUG_INFO|DEBUG_INFO_BTF)=' "$KCFG" || true
+          if grep -q '^CONFIG_DEBUG_INFO_BTF=y' "$KCFG"; then
+            echo "✅ BTF 已编译进内核（eBPF CO-RE 可用）"
+          else
+            echo "::warning::未检测到 CONFIG_DEBUG_INFO_BTF=y，依赖 BTF 的 eBPF 程序（如 dae/einat）无法运行"
+          fi
+
+      # ------------------------------------------------------------------
+      # 9. 整理产物 + 上传 + 发布 Release
+      # ------------------------------------------------------------------
+      - name: 整理产物
+        id: prep
+        run: |
+          cd "$SOURCE_DIR"
+          DATE="$(date +%Y%m%d)"
+          OUT="../out/${DATE}-${SOURCE_COMMIT_SHORT}-${PROFILE}"
+          mkdir -p "$OUT"
+          find bin/targets/mediatek/filogic -maxdepth 1 -type f \
+            \( -name '*.bin' -o -name '*.itb' -o -name '*.ubi' -o -name '*.fip' \
+               -o -name 'sha256sums' -o -name 'profiles.json' -o -name '*.manifest' \) \
+            -exec cp -v {} "$OUT/" \;
+
+          KCFG="$(ls build_dir/target-*/linux-*/.config 2>/dev/null | head -1)"
+          {
+            echo "构建时间   : $(date '+%F %T %Z')"
+            echo "源码仓库   : ${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}"
+            echo "源码分支   : ${{ github.event.inputs.source_ref || '25.12' }}"
+            echo "源码 commit: ${SOURCE_COMMIT}"
+            echo "设备 profile: ${PROFILE}"
+            echo
+            echo "===== 内核 eBPF / BTF ====="
+            grep -E '^CONFIG_(BPF|BPF_SYSCALL|BPF_JIT|BPF_EVENTS|CGROUP_BPF|NET_CLS_BPF|NET_ACT_BPF|XDP_SOCKETS|DEBUG_INFO|DEBUG_INFO_BTF)=' "$KCFG" || true
+            echo
+            echo "===== 产物清单 ====="
+            ls -lh "$OUT"
+            echo
+            echo "===== 完整性校验 ====="
+            (cd "$OUT" && sha256sum *)
+          } > "$OUT/build-info.txt"
+
+          cat "$OUT/build-info.txt"
+          echo "OUT_DIR=$OUT" >> "$GITHUB_ENV"
+          # 用 step 输出而不是 env，保证后续 with:/body: 里一定能取到值
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          echo "tag=ax6000-${DATE}-${SOURCE_COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "commit=${SOURCE_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "commit_short=${SOURCE_COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "profile=${PROFILE}" >> "$GITHUB_OUTPUT"
+          echo "source_repo=${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}" >> "$GITHUB_OUTPUT"
+          echo "source_ref=${{ github.event.inputs.source_ref || '25.12' }}" >> "$GITHUB_OUTPUT"
+          du -sh "$OUT"
+
+      - name: 上传固件为 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ax6000-${{ steps.prep.outputs.date }}-${{ steps.prep.outputs.profile }}
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.prep.outputs.tag }}
+          name: "Redmi AX6000 ${{ steps.prep.outputs.date }} (${{ steps.prep.outputs.profile }})"
+          files: out/**/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          body: |
+            ## Redmi AX6000 自编译固件
+
+            | 项目 | 内容 |
+            | --- | --- |
+            | 源码 | `${{ steps.prep.outputs.source_repo }}` @ `${{ steps.prep.outputs.source_ref }}` |
+            | 源码 commit | `${{ steps.prep.outputs.commit }}` |
+            | 设备 profile | `${{ steps.prep.outputs.profile }}` |
+            | 构建时间 | `${{ steps.prep.outputs.date }}` |
+
+            内核已启用 eBPF / BTF（`CONFIG_DEBUG_INFO_BTF=y`），预装 smartdns、eqos-mtk、
+            MTK 原厂闭源 WiFi 驱动、HNAT/WARP 硬件加速。
+
+            > ⚠️ 刷机有变砖风险。请务必刷与路由器当前 U-Boot 布局一致的镜像，
+            > 首次刷机前建议备份原厂分区。详细步骤见仓库 README。

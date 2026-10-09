@@ -1,0 +1,33 @@
+#!/bin/sh
+# ============================================================================
+#  首次启动时执行一次（uci-defaults），执行完会被自动删除
+#  作用：把固件的默认值调成国内好用的状态
+# ============================================================================
+
+# 主机名
+uci set system.@system[0].hostname='AX6000'
+
+# 时区 + 中文
+uci set system.@system[0].timezone='CST-8'
+uci set system.@system[0].zonename='Asia/Shanghai'
+
+# NTP 换成国内可用源
+uci -q delete system.ntp.server
+uci add_list system.ntp.server='ntp.aliyun.com'
+uci add_list system.ntp.server='ntp1.aliyun.com'
+uci add_list system.ntp.server='cn.pool.ntp.org'
+uci add_list system.ntp.server='time.cloudflare.com'
+uci commit system
+
+# ── 默认 LAN IP ─────────────────────────────────────────────────────────────
+# 想改成 192.168.31.1（和小米原厂一致）就取消下面两行注释
+# uci set network.lan.ipaddr='192.168.31.1'
+# uci commit network
+
+# ── 开箱就有 WiFi（注意：本固件是 MTK 闭源驱动，无线走 mtwifi-cfg） ────────
+# 闭源驱动的 SSID/密码在 /etc/config/wireless 里由 dat 文件生成，
+# 用下面这种「运行时改」的方式最稳（首次启动时无线可能还没起来，
+# 所以这里只写配置文件，重启后生效）：
+# sed -i 's/^\(\s*option ssid\s*\).*/\1'"'"'AX6000'"'"'/' /etc/config/wireless 2>/dev/null || true
+
+exit 0

@@ -1,0 +1,8 @@
+# 强制所有文本文件用 LF 换行 —— Windows 上编辑后提交到 GitHub 时
+# 如果变成 CRLF，shell 脚本会在 Actions 里报 "$'\r': command not found"
+* text eol=lf
+
+# shell 脚本 / uci-defaults 必须保持可执行
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

@@ -264,7 +264,16 @@ jobs:
                    kmod-mt_wifi kmod-warp kmod-mediatek_hnat \
                    kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal libbpf1 \
                    sing-box luci-app-homeproxy luci-i18n-homeproxy-zh-cn \
-                   kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag; do
+                   kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag \
+                   kmod-wireguard wireguard-tools luci-proto-wireguard luci-i18n-proto-wireguard-zh-cn \
+                   ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
+                   msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
+                   vlmcsd luci-app-vlmcsd luci-i18n-vlmcsd-zh-cn \
+                   luci-app-statistics luci-i18n-statistics-zh-cn \
+                   collectd-mod-interface collectd-mod-cpu collectd-mod-memory collectd-mod-load \
+                   collectd-mod-conntrack collectd-mod-uptime collectd-mod-ping collectd-mod-iptables \
+                   luci-app-nlbwmon luci-i18n-nlbwmon-zh-cn nlbwmon \
+                   luci-app-sqm luci-i18n-sqm-zh-cn sqm-scripts; do
             if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
               log "  [y] $p"
               echo "| \`$p\` | 已启用 |" >> "$GITHUB_STEP_SUMMARY"

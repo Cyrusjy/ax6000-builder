@@ -168,9 +168,14 @@ jobs:
           if ! grep -q "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${PROFILE}=y" .config; then
             echo "::error::profile ${PROFILE} 在当前源码中不存在！"
             echo "---- 源码里实际提供的 AX6000 相关 profile ----"
-            grep -oE 'DEVICE_xiaomi_redmi-router-ax6000[a-z0-9_-]*' target/linux/mediatek/image/filogic.mk | sort -u || true
+            # 注意：-mtkuboot 定义在 filogic-ext.mk（不是 filogic.mk），两个都要查
+            grep -rhoE 'DEVICE_xiaomi_redmi-router-ax6000[a-z0-9_-]*' \
+                 target/linux/mediatek/image/filogic.mk \
+                 target/linux/mediatek/image/filogic-ext.mk 2>/dev/null | sort -u || true
             echo "---- 源码里所有 xiaomi 设备 ----"
-            grep -oE 'DEVICE_xiaomi_[a-z0-9_-]+' target/linux/mediatek/image/filogic.mk | sort -u || true
+            grep -rhoE 'DEVICE_xiaomi_[a-z0-9_-]+' \
+                 target/linux/mediatek/image/filogic.mk \
+                 target/linux/mediatek/image/filogic-ext.mk 2>/dev/null | sort -u || true
             exit 1
           fi
           echo "✅ profile ${PROFILE} 已启用"
@@ -181,28 +186,78 @@ jobs:
       - name: 定制脚本 part2（内核 eBPF / 品牌 / 文件覆盖层）
         run: |
           cd "$SOURCE_DIR"
+          chmod +x ../builder/scripts/*.sh
+          # 该脚本内部会：注入内核符号 → 加候选包 → make defconfig（两轮）
+          #                → 回读 .config 自检 eBPF 开关，不通过直接 fail
           bash ../builder/scripts/diy-part2.sh
           if [ -d ../builder/files ]; then
             cp -rf ../builder/files/* .
           fi
           chmod +x files/etc/uci-defaults/* 2>/dev/null || true
-          make defconfig
 
       - name: 打印最终关键配置
         run: |
           cd "$SOURCE_DIR"
-          echo "===== 设备 / 镜像 ====="
-          grep -E '^CONFIG_TARGET_(MULTI_PROFILE|PER_DEVICE_ROOTFS|ROOTFS_SQUASHFS)|^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' .config || true
-          echo "===== 用户要求的插件是否生效 ====="
-          for p in smartdns luci-app-smartdns luci-i18n-smartdns-zh-cn luci-app-eqos-mtk \
-                   kmod-sched-bpf kmod-xdp-sockets-diag tc-bpf bpftool bpftool-full \
-                   kmod-mt_wifi kmod-mediatek_hnat luci-app-mturboacc-mtk luci-app-turboacc-mtk; do
-            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then echo "  [y] $p"; else echo "  [ ] $p  (不存在或未选中)"; fi
+          PRE="../builder-precheck.txt"
+          : > "$PRE"
+          # 本地调试时该变量不存在，兜底到 /dev/null（Actions 里一定有值）
+          : "${GITHUB_STEP_SUMMARY:=/dev/null}"
+
+          log() { echo "$@" | tee -a "$PRE"; }
+
+          log "===== 设备 / 镜像 ====="
+          grep -E '^CONFIG_TARGET_(MULTI_PROFILE|PER_DEVICE_ROOTFS|ROOTFS_SQUASHFS)|^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' .config | tee -a "$PRE" || true
+
+          {
+            echo "## 编译前配置核对"
+            echo
+            echo "| 项目 | 状态 |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          log ""
+          log "===== 用户要求的组件（包名已按 25.12 全树核实）====="
+          for p in smartdns luci-app-smartdns luci-i18n-smartdns-zh-cn \
+                   luci-app-eqos-mtk luci-i18n-eqos-mtk-zh-cn \
+                   luci-app-turboacc-mtk luci-app-mtwifi-cfg mtwifi-cfg-ucode \
+                   kmod-mt_wifi kmod-warp kmod-mediatek_hnat \
+                   kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal libbpf1; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              log "  [y] $p"
+              echo "| \`$p\` | 已启用 |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              log "  [ ] $p  (未选中 / 包名不存在)"
+              echo "| \`$p\` | 未启用 |" >> "$GITHUB_STEP_SUMMARY"
+            fi
           done
-          echo "===== 内核 eBPF 选项 ====="
-          grep -E '^CONFIG_KERNEL_(DEBUG_INFO|DEBUG_INFO_BTF|DEBUG_INFO_REDUCED|BPF_EVENTS|CGROUP_BPF|XDP_SOCKETS|KPROBES|KALLSYMS)' .config || true
-          echo "===== 选中包总数 ====="
-          grep -cE '^CONFIG_PACKAGE_.*=y' .config
+
+          log ""
+          log "===== 内核 eBPF 开关（OpenWrt 侧）====="
+          # 注意：DEBUG_INFO_REDUCED 期望是「未启用」，显示「未启用」即正确
+          for s in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_REDUCED BPF_EVENTS CGROUP_BPF XDP_SOCKETS KPROBES KALLSYMS; do
+            if grep -q "^CONFIG_KERNEL_${s}=y" .config; then
+              log "  [y] CONFIG_KERNEL_${s}"
+              echo "| \`KERNEL_${s}\` | 已启用 |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              log "  [ ] CONFIG_KERNEL_${s}"
+              echo "| \`KERNEL_${s}\` | 未启用 |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          log "  ---- pahole 工具（BTF 生成必需，由 KERNEL_DEBUG_INFO_BTF select）----"
+          DWARVES_LINE="$(grep -E '^CONFIG_DWARVES=' .config || true)"
+          log "  ${DWARVES_LINE:-（未在 .config 中显式出现，属正常）}"
+          echo "| \`DWARVES\`(pahole) | ${DWARVES_LINE:-由 select 自动开启} |" >> "$GITHUB_STEP_SUMMARY"
+
+          log ""
+          log "===== 选中包总数 ====="
+          grep -cE '^CONFIG_PACKAGE_.*=y' .config | tee -a "$PRE"
+
+          log ""
+          log "===== 注入到 target 内核 config 的符号 ====="
+          tail -30 target/linux/mediatek/filogic/config-* | tee -a "$PRE"
+
+          echo "PRECHECK_FILE=$PRE" >> "$GITHUB_ENV"
 
       # ------------------------------------------------------------------
       # 7. 预下载 + 编译
@@ -237,13 +292,34 @@ jobs:
       - name: 校验内核 eBPF / BTF 实际状态
         run: |
           cd "$SOURCE_DIR"
-          KCFG="$(ls build_dir/target-*/linux-*/.config 2>/dev/null | head -1)"
-          echo "内核配置文件: $KCFG"
-          grep -E '^CONFIG_(BPF|BPF_SYSCALL|BPF_JIT|BPF_EVENTS|CGROUP_BPF|NET_CLS_BPF|NET_ACT_BPF|XDP_SOCKETS|DEBUG_INFO|DEBUG_INFO_BTF)=' "$KCFG" || true
+
+          # 上一轮这里写的是 `ls build_dir/target-*/linux-*/.config`，
+          # 少了一层 linux-<版本> 目录（内核 .config 在 $(LINUX_DIR)/.config），
+          # 导致路径取空、校验静默失效并打印假告警。改用内容 + 多路径探测。
+          if KCFG="$(bash ../builder/scripts/find-kernel-config.sh)"; then
+            echo "内核配置文件: $KCFG"
+          else
+            echo "::error::未能定位内核 .config，无法校验 eBPF 是否真的编入"
+            echo "---- build_dir 结构（前 3 层）----"
+            find build_dir -maxdepth 3 -type d 2>/dev/null | head -40 || true
+            exit 1
+          fi
+          echo "KERNEL_CONFIG_FILE=$KCFG" >> "$GITHUB_ENV"
+
+          echo "===== 内核里 eBPF / BTF 的真实状态 ====="
+          grep -E '^#? ?CONFIG_(BPF|BPF_SYSCALL|BPF_JIT|BPF_EVENTS|CGROUP_BPF|NET_CLS_BPF|NET_ACT_BPF|XDP_SOCKETS|XDP_SOCKETS_DIAG|DEBUG_INFO|DEBUG_INFO_BTF|DEBUG_INFO_REDUCED|KPROBES|KPROBE_EVENTS|IKCONFIG)' "$KCFG" || true
+
+          echo
           if grep -q '^CONFIG_DEBUG_INFO_BTF=y' "$KCFG"; then
             echo "✅ BTF 已编译进内核（eBPF CO-RE 可用）"
+            echo "BTF_OK=yes" >> "$GITHUB_ENV"
+            echo "- 内核 BTF：✅ 已生效" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "::warning::未检测到 CONFIG_DEBUG_INFO_BTF=y，依赖 BTF 的 eBPF 程序（如 dae/einat）无法运行"
+            echo "::warning::内核 .config 里没有 CONFIG_DEBUG_INFO_BTF=y —— eBPF CO-RE 不可用"
+            echo "  排查顺序：① 内核 .config 里 DEBUG_INFO_REDUCED 是否被置回 y"
+            echo "            ② CONFIG_DWARVES/pahole 是否可用"
+            echo "BTF_OK=no" >> "$GITHUB_ENV"
+            echo "- 内核 BTF：⚠️ 未生效（详见 kernel-config 产物）" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # ------------------------------------------------------------------
@@ -261,23 +337,65 @@ jobs:
                -o -name 'sha256sums' -o -name 'profiles.json' -o -name '*.manifest' \) \
             -exec cp -v {} "$OUT/" \;
 
-          KCFG="$(ls build_dir/target-*/linux-*/.config 2>/dev/null | head -1)"
+          # ---- 把「证据」一并导出，以后不需要读 Actions 日志 ----
+          # 1) 内核 .config 全文：eBPF/BTF 是否真编入的最终证据
+          KCFG="${KERNEL_CONFIG_FILE:-}"
+          if [ -n "$KCFG" ] && [ -f "$KCFG" ]; then
+            cp "$KCFG" "$OUT/kernel-config.txt"
+          else
+            echo "内核 .config 路径未知" > "$OUT/kernel-config.txt"
+          fi
+          # 2) 编译前的配置核对结果
+          if [ -n "${PRECHECK_FILE:-}" ] && [ -f "$PRECHECK_FILE" ]; then
+            cp "$PRECHECK_FILE" "$OUT/precheck.txt"
+          fi
+
+          # 先判定 BTF 结论（用于 Release 说明；不再硬编码宣称）
+          BTF_NOTE="❓ 未能定位内核 .config，BTF 状态未知，请查看 kernel-config.txt"
+          BTF_VERDICT="结论: ❓ 无法判定"
+          if [ -n "$KCFG" ] && [ -f "$KCFG" ]; then
+            if grep -q '^CONFIG_DEBUG_INFO_BTF=y' "$KCFG"; then
+              BTF_NOTE="内核已启用 eBPF / BTF（CONFIG_DEBUG_INFO_BTF=y），CORE 程序可直接运行"
+              BTF_VERDICT="结论: ✅ BTF 已编入内核，eBPF CO-RE 可用"
+            else
+              BTF_NOTE="⚠️ 本次内核**未**启用 BTF（CONFIG_DEBUG_INFO_BTF 未生效），eBPF CO-RE 不可用"
+              BTF_VERDICT="结论: ❌ 内核缺少 CONFIG_DEBUG_INFO_BTF=y，eBPF CO-RE 不可用"
+            fi
+          fi
+
           {
-            echo "构建时间   : $(date '+%F %T %Z')"
-            echo "源码仓库   : ${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}"
-            echo "源码分支   : ${{ github.event.inputs.source_ref || '25.12' }}"
-            echo "源码 commit: ${SOURCE_COMMIT}"
+            echo "构建时间    : $(date '+%F %T %Z')"
+            echo "源码仓库    : ${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}"
+            echo "源码分支    : ${{ github.event.inputs.source_ref || '25.12' }}"
+            echo "源码 commit : ${SOURCE_COMMIT}"
             echo "设备 profile: ${PROFILE}"
+            echo "内核 config : ${KCFG:-（未找到）}"
             echo
-            echo "===== 内核 eBPF / BTF ====="
-            grep -E '^CONFIG_(BPF|BPF_SYSCALL|BPF_JIT|BPF_EVENTS|CGROUP_BPF|NET_CLS_BPF|NET_ACT_BPF|XDP_SOCKETS|DEBUG_INFO|DEBUG_INFO_BTF)=' "$KCFG" || true
+            echo "===== 内核 eBPF / BTF 实际状态（最终证据）====="
+            if [ -n "$KCFG" ] && [ -f "$KCFG" ]; then
+              grep -E '^#? ?CONFIG_(BPF|BPF_SYSCALL|BPF_JIT|BPF_EVENTS|CGROUP_BPF|NET_CLS_BPF|NET_ACT_BPF|XDP_SOCKETS|XDP_SOCKETS_DIAG|DEBUG_INFO|DEBUG_INFO_BTF|DEBUG_INFO_REDUCED|KPROBES|KPROBE_EVENTS|IKCONFIG)' "$KCFG" || true
+            fi
+            echo
+            echo "$BTF_VERDICT"
+            echo
+            echo "===== 编译前配置核对（节选）====="
+            if [ -n "${PRECHECK_FILE:-}" ] && [ -f "$PRECHECK_FILE" ]; then
+              grep -E '^\[|^  \[y\]|^  \[ \]|^CONFIG_PACKAGE_|^CONFIG_KERNEL_|^  ----|^=====' "$PRECHECK_FILE" || cat "$PRECHECK_FILE"
+            fi
             echo
             echo "===== 产物清单 ====="
-            ls -lh "$OUT"
-            echo
-            echo "===== 完整性校验 ====="
-            (cd "$OUT" && sha256sum *)
+            ls -lh "$OUT" | grep -v -- 'build-info.txt' || true
           } > "$OUT/build-info.txt"
+
+          # 校验段最后追加，并排除 build-info.txt 自身
+          # （原版把 sha256sum * 写在同一个 {} 里，导致 build-info.txt 的哈希
+          #   是「写到一半」的状态，永远校验不通过）
+          {
+            echo
+            echo "===== 完整性校验（不含 build-info.txt 自身）====="
+            ( cd "$OUT" && find . -maxdepth 1 -type f ! -name 'build-info.txt' -printf '%f\n' \
+                | sort | xargs sha256sum )
+          } >> "$OUT/build-info.txt"
 
           cat "$OUT/build-info.txt"
           echo "OUT_DIR=$OUT" >> "$GITHUB_ENV"
@@ -289,6 +407,7 @@ jobs:
           echo "profile=${PROFILE}" >> "$GITHUB_OUTPUT"
           echo "source_repo=${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}" >> "$GITHUB_OUTPUT"
           echo "source_ref=${{ github.event.inputs.source_ref || '25.12' }}" >> "$GITHUB_OUTPUT"
+          echo "btf_note=${BTF_NOTE}" >> "$GITHUB_OUTPUT"
           du -sh "$OUT"
 
       - name: 上传固件为 artifact
@@ -317,8 +436,13 @@ jobs:
             | 设备 profile | `${{ steps.prep.outputs.profile }}` |
             | 构建时间 | `${{ steps.prep.outputs.date }}` |
 
-            内核已启用 eBPF / BTF（`CONFIG_DEBUG_INFO_BTF=y`），预装 smartdns、eqos-mtk、
-            MTK 原厂闭源 WiFi 驱动、HNAT/WARP 硬件加速。
+            **内核状态**：${{ steps.prep.outputs.btf_note }}
+
+            预装：MTK 原厂闭源 WiFi 驱动（kmod-mt_wifi 7.6.7.3）、HNAT/WARP 硬件加速、
+            smartdns、eqos-mtk。
+
+            📎 附件里的 `build-info.txt` / `kernel-config.txt` / `precheck.txt`
+            是本次构建的完整证据（内核实测配置、包清单、编译前核对结果）。
 
             > ⚠️ 刷机有变砖风险。请务必刷与路由器当前 U-Boot 布局一致的镜像，
             > 首次刷机前建议备份原厂分区。详细步骤见仓库 README。

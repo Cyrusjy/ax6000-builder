@@ -263,6 +263,7 @@ jobs:
                    kmod-mt_wifi kmod-warp kmod-mediatek_hnat \
                    kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal libbpf1 \
                    kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag \
+                   ip-full kmod-dummy kmod-nft-socket \
                    kmod-wireguard wireguard-tools luci-proto-wireguard luci-i18n-proto-wireguard-zh-cn \
                    ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
                    msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \

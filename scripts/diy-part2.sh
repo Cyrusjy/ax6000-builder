@@ -251,19 +251,19 @@ for p in kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal bpftool libbpf1 li
 done
 
 echo
-echo "  ---- sing-box 内核模块依赖（必须预装进固件，用户自装官方 1.14.3 时要用） ----"
-for p in kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag; do
+echo "  ---- sing-box + momo 安装环境（必须预装进固件，用户自装时要用） ----"
+for p in kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag ip-full kmod-dummy kmod-nft-socket; do
   if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
     echo "  [OK]   $p"
   else
-    echo "  [FAIL] $p  （未选中 —— 用户装 sing-box 1.14.3 会因缺依赖失败）"
+    echo "  [FAIL] $p  （未选中 —— 用户装 sing-box/momo 会因缺依赖失败）"
     FAIL=1
   fi
 done
 
 echo
-echo "  ---- sing-box 本体（故意不编入，用户自行安装官方 1.14.3） ----"
-for p in sing-box luci-app-homeproxy luci-i18n-homeproxy-zh-cn; do
+echo "  ---- sing-box / momo 本体（故意不编入，用户自行安装） ----"
+for p in sing-box luci-app-homeproxy luci-i18n-homeproxy-zh-cn momo luci-app-momo luci-i18n-momo-zh-cn; do
   if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
     echo "  [WARN] $p 被编入了（预期是不选）"
   else

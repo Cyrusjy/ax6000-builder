@@ -156,14 +156,10 @@ for kmod in nft-queue nfnetlink-queue netlink-diag; do
   fi
 done
 
-# sing-box 和 luci-app-homeproxy 的包存在性初判（feeds packages / luci）
-for pkg in sing-box luci-app-homeproxy luci-i18n-homeproxy-zh-cn; do
-  if find package feeds -maxdepth 5 -type d -name "$pkg" 2>/dev/null | grep -q .; then
-    echo "  [+] $pkg 存在"
-  else
-    echo "  [-] $pkg 未找到同名目录（可能包名不同或在 feeds 里）"
-  fi
-done
+# 注意：sing-box 本体与 luci-app-homeproxy **故意不编入固件**
+# 用户会在刷机后自行安装官方 sing-box 1.14.3（架构 aarch64_cortex-a53），
+# 固件只需预置它的内核模块依赖（kmod-nft-queue / kmod-nfnetlink-queue /
+# kmod-netlink-diag）。所以这里只做提示，不加入候选包。
 
 # ----------------------------------------------------------------------------
 # 3) make defconfig —— 解析依赖、把无效项丢弃
@@ -255,19 +251,29 @@ for p in kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal bpftool libbpf1 li
 done
 
 echo
-echo "  ---- sing-box 相关包（defconfig 后的真实状态） ----"
-for p in sing-box luci-app-homeproxy kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag; do
+echo "  ---- sing-box 内核模块依赖（必须预装进固件，用户自装官方 1.14.3 时要用） ----"
+for p in kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag; do
   if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
     echo "  [OK]   $p"
   else
-    echo "  [FAIL] $p  （未选中 —— 这是 sing-box 的依赖，必须生效）"
+    echo "  [FAIL] $p  （未选中 —— 用户装 sing-box 1.14.3 会因缺依赖失败）"
     FAIL=1
+  fi
+done
+
+echo
+echo "  ---- sing-box 本体（故意不编入，用户自行安装官方 1.14.3） ----"
+for p in sing-box luci-app-homeproxy luci-i18n-homeproxy-zh-cn; do
+  if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+    echo "  [WARN] $p 被编入了（预期是不选）"
+  else
+    echo "  [OK]   $p 未编入（符合预期）"
   fi
 done
 echo "======================================================"
 
 if [ "$FAIL" = "1" ]; then
-  echo "::error::eBPF/BTF 关键内核开关未生效，请检查上面的 [FAIL] 行"
+  echo "::error::关键内核开关或 sing-box 依赖模块未生效，请检查上面的 [FAIL] 行"
   exit 1
 fi
 

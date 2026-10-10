@@ -258,28 +258,34 @@ jobs:
 
           log ""
           log "===== 用户要求的组件（包名已按 25.12 全树核实）====="
-          for p in smartdns luci-app-smartdns luci-i18n-smartdns-zh-cn \
-                   luci-app-eqos-mtk luci-i18n-eqos-mtk-zh-cn \
+          for p in luci-app-eqos-mtk luci-i18n-eqos-mtk-zh-cn \
                    luci-app-turboacc-mtk luci-app-mtwifi-cfg mtwifi-cfg-ucode \
                    kmod-mt_wifi kmod-warp kmod-mediatek_hnat \
                    kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal libbpf1 \
-                   sing-box luci-app-homeproxy luci-i18n-homeproxy-zh-cn \
                    kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag \
                    kmod-wireguard wireguard-tools luci-proto-wireguard luci-i18n-proto-wireguard-zh-cn \
                    ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
                    msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
-                   vlmcsd luci-app-vlmcsd luci-i18n-vlmcsd-zh-cn \
-                   luci-app-statistics luci-i18n-statistics-zh-cn \
-                   collectd-mod-interface collectd-mod-cpu collectd-mod-memory collectd-mod-load \
-                   collectd-mod-conntrack collectd-mod-uptime collectd-mod-ping collectd-mod-iptables \
-                   luci-app-nlbwmon luci-i18n-nlbwmon-zh-cn nlbwmon \
-                   luci-app-sqm luci-i18n-sqm-zh-cn sqm-scripts; do
+                   miniupnpd luci-app-upnp luci-i18n-upnp-zh-cn \
+                   vlmcsd luci-app-vlmcsd luci-i18n-vlmcsd-zh-cn; do
             if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
               log "  [y] $p"
               echo "| \`$p\` | 已启用 |" >> "$GITHUB_STEP_SUMMARY"
             else
               log "  [ ] $p  (未选中 / 包名不存在)"
               echo "| \`$p\` | 未启用 |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          log ""
+          log "===== 故意不编入（用户刷机后自行安装官方版本）====="
+          for p in sing-box luci-app-homeproxy luci-i18n-homeproxy-zh-cn; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              log "  [!] $p  被编入了（预期是不选）"
+              echo "| \`$p\` | ⚠️意外编入 |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              log "  [OK] $p 未编入（符合预期，用户自装官方 1.14.3）"
+              echo "| \`$p\` | 按预期未编入 |" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
 

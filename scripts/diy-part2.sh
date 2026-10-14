@@ -34,10 +34,10 @@ echo "==> 注入 eBPF 内核选项到 $KCFG"
 # 先删掉同名旧行，避免重复定义
 # 注意：模式里的 [ =]/$ 保证 CONFIG_DEBUG_INFO 不会误删 CONFIG_DEBUG_INFO_BTF
 for sym in BPF BPF_SYSCALL BPF_JIT BPF_EVENTS CGROUP_BPF BPF_STREAM_PARSER \
-           NET_CLS_BPF NET_ACT_BPF NET_CLS_ACT NET_SCH_CLSACT NET_SCH_INGRESS \
+           NET_CLS_BPF NET_ACT_BPF NET_CLS_ACT NET_SCH_INGRESS \
            XDP_SOCKETS XDP_SOCKETS_DIAG DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_REDUCED \
            KPROBES KPROBE_EVENTS UPROBE_EVENTS IKCONFIG IKCONFIG_PROC \
-           NETLINK_DIAG NFNETLINK_QUEUE NETFILTER_XT_TARGET_NFQUEUE \
+           NETLINK_DIAG NETFILTER_NETLINK_QUEUE NETFILTER_XT_TARGET_NFQUEUE \
            WIREGUARD; do
   sed -i -E "/^#? ?CONFIG_${sym}[ =]/d" "$KCFG"
 done
@@ -52,7 +52,9 @@ CONFIG_CGROUP_BPF=y
 CONFIG_NET_CLS_BPF=y
 CONFIG_NET_ACT_BPF=y
 CONFIG_NET_CLS_ACT=y
-CONFIG_NET_SCH_CLSACT=y
+# 注意：没有 CONFIG_NET_SCH_CLSACT 这个符号。
+# clsact qdisc 在 6.12 里内建于 sch_ingress（CONFIG_NET_SCH_INGRESS），
+# 单独写 NET_SCH_CLSACT 会被 Kconfig 静默忽略（旧版本这里就写错了）。
 CONFIG_NET_SCH_INGRESS=y
 CONFIG_XDP_SOCKETS=y
 CONFIG_XDP_SOCKETS_DIAG=y
@@ -68,12 +70,12 @@ CONFIG_UPROBE_EVENTS=y
 CONFIG_IKCONFIG=y
 CONFIG_IKCONFIG_PROC=y
 # ===== sing-box 1.14.3 内核模块依赖（injected by ax6000-builder）=====
-# kmod-nft-queue 需要 CONFIG_NFNETLINK_QUEUE（=m 即可）
+# 真实符号名是 CONFIG_NETFILTER_NETLINK_QUEUE（旧写法 NFNETLINK_QUEUE 不存在，
+# 会被静默忽略）。kmod-nft-queue / kmod-nfnetlink-queue 都依赖它，=m 即可。
 # kmod-netlink-diag 需要 CONFIG_NETLINK_DIAG（=m 即可）
-# kmod-nfnetlink-queue 需要 CONFIG_NFNETLINK_QUEUE（=m 即可）
 # sing-box ipk 还 depends kmod-nft-queue，后者 depends kmod-nfnetlink-queue
 CONFIG_NETLINK_DIAG=m
-CONFIG_NFNETLINK_QUEUE=m
+CONFIG_NETFILTER_NETLINK_QUEUE=m
 CONFIG_NETFILTER_XT_TARGET_NFQUEUE=m
 # WireGuard VPN 隧道（kmod-wireguard 依赖，当前 kernel config 为 not set）
 CONFIG_WIREGUARD=m

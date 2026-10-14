@@ -284,6 +284,26 @@ files/etc/uci-defaults/99-ax6000-custom   首次启动脚本（主机名/时区/
 
 ## 八、变更记录
 
+### 2026-10-14 基于产物逐项体检的修复（`a99b088` 固件实测）
+
+对 Release `ax6000-20261010-a99b088` 做了**不依赖日志**的体检：从固件镜像里解出内核
+并提取其**内嵌**的 IKCONFIG，再解开 squashfs 核对全部 2114 个条目。核心能力全部通过
+（BTF 段真实存在、MTK 闭源 WiFi、HNAT/WARP、9 个 LuCI 插件齐全），同时查出以下问题并修复：
+
+| # | 问题 | 机理 | 修复 |
+| --- | --- | --- | --- |
+| 13 | **`files/` 覆盖层路径错误 → `99-ax6000-custom` 从未进入固件** | 流水线写的是 `cp -rf ../builder/files/* .`。`files/*` 只展开出 `files/etc` 一个条目，而 `cp -r <目录> .` 是**把该目录整体复制进 `.`**，结果落到 `./etc/…`；而 OpenWrt 只从 `$(TOPDIR)/files` 读覆盖层（`include/image.mk` 与 `package/Makefile` 两处都是 `$(call prepare_rootfs,$(TARGET_DIR),$(TOPDIR)/files)`）。路径不匹配 → 文件躺在错误位置，**永不进固件**。紧跟的 `chmod … \|\| true` 又把错误吞掉 → **全程静默** | 改为 `mkdir -p files && cp -a ../builder/files/. files/`，并加**逐个文件到位校验**：源树里每个文件都必须在 `files/` 下存在，缺一个就 `::error::` + `exit 1`。已用真实 bash 验证成功/失败两个分支 |
+| 14 | **两条内核符号名在 6.12 里不存在** | `CONFIG_NFNETLINK_QUEUE` 与 `CONFIG_NET_SCH_CLSACT` 均无此符号，会被 Kconfig 静默忽略。真实名是 `CONFIG_NETFILTER_NETLINK_QUEUE`；clsact qdisc 内建于 `CONFIG_NET_SCH_INGRESS` | 改为真实符号名；删除不存在的 `NET_SCH_CLSACT` 并加注释说明。**功能未缺失**（`kmod-nfnetlink-queue` 一直在 manifest 里），修的是「虚假安全感」 |
+| 15 | **`CONFIG_PACKAGE_ebtables=y` 被静默丢弃** | 25.12 里真实包名是 `ebtables-legacy`（`PROVIDES:=ebtables`），裸 `ebtables` 不存在 | 改为 `CONFIG_PACKAGE_ebtables-legacy=y` |
+| 16 | **`CONFIG_PACKAGE_miniupnpd=y` 被静默丢弃** | `miniupnpd` 是**变体包**：真实名 `miniupnpd-iptables` / `miniupnpd-nftables`（后者 `DEFAULT_VARIANT`、`PROVIDES:=miniupnpd`）。实际入固件的是被 `luci-app-upnp` 依赖带入的 `miniupnpd-nftables` | 显式改为 `CONFIG_PACKAGE_miniupnpd-nftables=y`，并删掉「常用包」段里重复的无效裸名 |
+| 17 | **`luci-i18n-proto-wireguard-zh-cn` 不存在** | 上游 `protocols/luci-proto-wireguard/` 下只有 `Makefile` / `htdocs` / `root`，**没有 `po/` 目录** → 不生成任何语言包 | 从配置与预检清单中删除（WireGuard 页面就是英文的，属上游现状） |
+| 18 | **`luci-theme-bootstrap-mod` 不存在** | luci feed 的 `themes/` 下只有 argon / bootstrap / footstrap / material / openwrt 系列 | 删除该行；实际生效主题是 argon + bootstrap |
+| 19 | **预检清单两处误报** | `libbpf1` 是 `ip-full` 的依赖、自动带入，显式列会因「未被用户直接选中」误报未启用；`miniupnpd` 裸名同理 | 清单里 `libbpf1` 改为注释说明；`miniupnpd` → `miniupnpd-nftables`；`luci-i18n-proto-wireguard-zh-cn` 移除 |
+
+**教训**：`make defconfig` 对不存在的包是**静默丢弃**，所以「配置里写了」≠「固件里有」。
+本轮 6 个问题里有 4 个是同一类：**包名/符号名/路径与实际不符，且完全无报错**。
+判断依据永远是 **manifest（包）+ 内核内嵌 IKCONFIG（内核开关）**，不是配置文件本身。
+
 ### 2026-10-09 第三次编译前的修复（缓存顺序 bug 导致第二次编译 3 分钟即失败）
 
 第二次运行（run `37946575159`）在**第 8 步「克隆源码」就挂了**，退出码 128，总共只跑了 3 分钟，

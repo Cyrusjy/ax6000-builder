@@ -231,10 +231,47 @@ jobs:
           # 该脚本内部会：注入内核符号 → 加候选包 → make defconfig（两轮）
           #                → 回读 .config 自检 eBPF 开关，不通过直接 fail
           bash ../builder/scripts/diy-part2.sh
+
+          # ----------------------------------------------------------------
+          # 自定义文件覆盖层 —— 目标目录必须是 $(TOPDIR)/files
+          #
+          # ⚠️ 这里曾经写的是 `cp -rf ../builder/files/* .`，是**错的**：
+          #    `files/*` 只展开出 `files/etc` 一个条目，而 `cp -r <目录> .`
+          #    是把该目录整体复制进 `.`，结果落到 `./etc/…`，永远不进固件。
+          #    OpenWrt 只认 $(TOPDIR)/files：
+          #      include/image.mk : $(call prepare_rootfs,$(TARGET_DIR),$(TOPDIR)/files)
+          #      package/Makefile : $(call prepare_rootfs,$(TARGET_DIR),$(TOPDIR)/files)
+          #    所以必须先把内容放进 `./files/`，再做逐个文件的到位校验。
+          #    （旧写法下 `99-ax6000-custom` 从未进入固件，且因为
+          #      `chmod … || true` 而完全静默 —— 见 README 变更记录）
+          # ----------------------------------------------------------------
           if [ -d ../builder/files ]; then
-            cp -rf ../builder/files/* .
+            mkdir -p files
+            cp -a ../builder/files/. files/
+
+            echo "===== 自定义覆盖层 files/ 内容 ====="
+            find files -type f | sort
+
+            # 逐个核对源文件都到位；缺一个就 fail，不再静默放过
+            MISSING_OVERLAY=0
+            while IFS= read -r rel; do
+              [ -n "$rel" ] || continue
+              if [ ! -f "files/$rel" ]; then
+                echo "::error::覆盖层缺少文件: $rel"
+                MISSING_OVERLAY=1
+              fi
+            done < <(cd ../builder/files && find . -type f -printf '%P\n' | sort)
+
+            if [ "$MISSING_OVERLAY" != "0" ]; then
+              echo "::error::自定义覆盖层复制不完整，固件里会缺文件"
+              exit 1
+            fi
+            echo "✅ 覆盖层文件全部就位（$(find files -type f | wc -l) 个）"
+
+            chmod +x files/etc/uci-defaults/* 2>/dev/null || true
+          else
+            echo "::warning::../builder/files 不存在，跳过自定义覆盖层"
           fi
-          chmod +x files/etc/uci-defaults/* 2>/dev/null || true
 
       - name: 打印最终关键配置
         run: |
@@ -258,16 +295,21 @@ jobs:
 
           log ""
           log "===== 用户要求的组件（包名已按 25.12 全树核实）====="
+          # 注意：luci-i18n-proto-wireguard-zh-cn **不存在** —— 上游 luci 的
+          # protocols/luci-proto-wireguard/ 下没有 po/ 目录，故没有中文语言包。
+          # 之前把它列在检查清单里，只会长期显示误导性的「未启用」。
+          # libbpf1 不在这里列：它是 ip-full 的依赖、自动带入，
+          # 显式列会因「未被用户直接选中」而误报为未启用（实测已入固件）。
           for p in luci-app-eqos-mtk luci-i18n-eqos-mtk-zh-cn \
                    luci-app-turboacc-mtk luci-app-mtwifi-cfg mtwifi-cfg-ucode \
                    kmod-mt_wifi kmod-warp kmod-mediatek_hnat \
-                   kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal libbpf1 \
+                   kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal \
                    kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag \
                    ip-full kmod-dummy kmod-nft-socket \
-                   kmod-wireguard wireguard-tools luci-proto-wireguard luci-i18n-proto-wireguard-zh-cn \
+                   kmod-wireguard wireguard-tools luci-proto-wireguard \
                    ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
                    msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
-                   miniupnpd luci-app-upnp luci-i18n-upnp-zh-cn \
+                   miniupnpd-nftables luci-app-upnp luci-i18n-upnp-zh-cn \
                    vlmcsd luci-app-vlmcsd luci-i18n-vlmcsd-zh-cn; do
             if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
               log "  [y] $p"

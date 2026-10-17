@@ -339,3 +339,48 @@ files/etc/uci-defaults/99-ax6000-custom   首次启动脚本（主机名/时区/
 **这一轮新增的可验证性**：编译完成后，Release 里的 `kernel-config.txt` 是内核实测配置，
 `build-info.txt` 里有一行 `结论: ✅/❌ BTF ...`。**只看这两个文件就能确认 eBPF 有没有真编进去。**
 
+---
+
+### 2026-10-14 / 10-15 流水线运维修复（ttyd 编入 + 缓存配额治理）
+
+10-14 两次编译（run 8 `c79d028` 1h28m、run 9 `1b10202` 1h38m）全绿，
+Release `ax6000-20261014-468e251` / `ax6000-20261015-468e251`。
+run 8 即上面 #13–19 那批修复的实编验证；run 9 追加 ttyd。
+本轮把「编译能过但流水线在慢性自伤」的问题一并清掉：
+
+| # | 问题 | 机理 / 证据 | 修复 |
+| --- | --- | --- | --- |
+| 20 | **`dl/` 缓存 key 带 `hashFiles(config)`，每改一次配置多存一份 1.8GB** | `actions/caches` API 实测：`dl-468e251-fa6960…`(1.80GB) 与 `dl-468e251-eec9ae…`(1.78GB) 并存，加上两份 ccache 共占 **6.6GB / 10GB 配额**。dl/ 里只是源码包压缩包，与 `.config` 毫无关系 | key 改为 `dl-${上游sha}`，只按源码 commit 区分；`restore-keys: dl-` 保持兼容 |
+| 21 | **ccache key 带 `run_number`，每次必然新增 0.56GB** | 同上，`ccache-468e251-8` / `-9` 两份并存，永不覆盖 | 改为**固定滚动 key** + `cache/restore` + `cache/save` 两步（单 step 在 miss 时不会保存，必须拆开）；`CCACHE_MAXSIZE` 2G→1G（实测只用 560MB） |
+| 22 | **Release tag 会撞车，撞了就覆盖旧版本** | tag = `ax6000-${日期}-${上游短sha}`，同一天 + 同源码编两次即同 tag，`action-gh-release` 会**更新**已存在 Release。历史已发生：第三次与第五次都产出 `ax6000-20261010-ae65e1d`，后一次盖掉前一次 | tag 追加 `-r${GITHUB_RUN_NUMBER}`，单调递增 |
+| 23 | **没有 concurrency 控制** | 连推两次会并行跑两个 build：同抢 tag、同读写 ccache、同占 runner | 加 `concurrency: {group: ax6000-build, cancel-in-progress: true}` |
+| 24 | **Release 说明硬编码「预装 smartdns」，而 smartdns 第 6 版已按要求移除** | 每次发版都在 Release 页面写一句假话 | 「预装」改为从 `.manifest` **实测生成**，并明确写出 sing-box/momo/homeproxy/smartdns 的按需不预装策略 |
+| 25 | **预检清单是手写的 30 多个包名** | 加插件要同步两处，忘了就漂移（ttyd 就是手工补进去的） | 改为从 `.config` 自动提取 `CONFIG_PACKAGE_*=y`，天然不漂移 |
+| 26 | **`diy-part1.sh` 还在查已移除的 smartdns** | 长期输出误导性 `[WARN]` | 从检查清单移除，并注释说明原因（含 libbpf1 为何不查） |
+| 27 | **缺「manifest 实测」段，依赖 precheck 推断** | precheck 只反映「配置里写了什么」，且对依赖自动带入的包会误报（`libbpf1` ← `ip-full` 被误报过一次） | `build-info.txt` 新增 **manifest 实测**段：核心能力逐项 `[y]/[ ]` + 应排除项反向核对 + LuCI 图形插件全清单。manifest 才是「固件里真有什么」的唯一权威判据 |
+| 28 | **`tc-tiny` 装不了 eBPF 程序** | OpenWrt 把 `tc` 拆成 tiny/full 两个互斥变体，**BPF 对象加载只在 `tc-full`**（[拆分提交](https://git.openwrt.org/openwrt/staging/pepe2k/commit/?id=72885e9608d9c0fa06abce6bdb6dd054c2116eb7)）。固件预装了 `bpftool-minimal` + `kmod-sched-bpf` + `XDP_SOCKETS_DIAG`，却少这个入口 | 改 `CONFIG_PACKAGE_tc-full=y`。注：sing-box/mihomo 自带 loader 不依赖 tc，非硬需求 |
+| 29 | **根目录 `AX6000-build-guide.md` / `build-ax6000.yml` 是废弃草稿** | 含「2GB eMMC」（实际 128MB SPI-NAND）、`./scripts/download`（该脚本不存在）、推荐 stock 布局等错误 | 顶部加醒目作废声明，逐条列已证伪内容 |
+
+**本轮新增的可验证性**：`build-info.txt` 的「manifest 实测」段让「某插件到底进没进固件」
+不再需要翻日志或解开 squashfs —— 编译完成即知。
+
+**遗留（未改，需用户决策）**：
+- `files/etc/uci-defaults/99-ax6000-custom` 目前只设主机名/时区/NTP，
+  **未预置 WiFi SSID/密码，也未强制首次改密码** —— 2026-10-17 已与用户确认：
+  **不预置 WiFi**，保持「开箱空密码 + 无 WiFi」，由用户首次进 LuCI 手动配置。
+
+### 2026-10-17 actions 全面升级到 v6 + runner 迁移到 24.04
+
+| # | 问题 | 机理 / 证据 | 修复 |
+| --- | --- | --- | --- |
+| 30 | **`actions/*@v4` 已被强制跑在 Node 20→24 兼容层** | 每次 run 都刷一条 warning：`Node.js 20 is deprecated ... actions/cache@v4, actions/checkout@v4, actions/upload-artifact@v4, softprops/action-gh-release@v2` | 全部升到 **v6**（checkout / cache / cache/restore / cache/save / upload-artifact）。选 v6 而非 v5：两者同为 Node 24 运行时，但 v6 是主线且 `cache-mode` 语义文档最明确 |
+| 31 | **v5/v6 起 `cache-mode` 默认值取决于触发类型** | [GitHub Changelog 2026-09-10](https://github.blog/changelog/2026-09-10-control-github-actions-cache-access-with-cache-mode/)：不显式指定时，trusted 事件默认 `write`、low-trust 默认 `read`。依赖隐式默认不可靠 —— 哪天把触发方式从 `push` 改成 `pull_request`，缓存就会**静默不再保存** | 三个缓存 step 全部**显式写 `cache-mode`**（dl 和 save 用 `write`，restore 用 `read`） |
+| 32 | **`jlumbroso/free-disk-space@main` 用浮动 ref，且该 action 已废弃** | 2026-08-30 起无人维护（安全评分 F），README 示例里甚至已出现 `@v2` 而我们用 `@main`；它 hardcode 的「预装大件」路径随 runner 镜像更新会漏删 | **改为内联 shell 清理**：显式删 `/usr/share/dotnet`(~6GB) `/usr/local/lib/android`(~8GB) `/opt/ghc`(~2GB) `/usr/local/share/boost` / `/usr/share/swift` `/opt/hostedtoolcache/CodeQL` + apt 缓存与 journal。不依赖第三方、行为可控可复现 |
+| 33 | **`runs-on: ubuntu-22.04` 已停止积极支持** | [runner-images#14254](https://github.com/actions/runner-images/issues/14254)：2026-09-17 起 deprecated，deprecation 期间有 brownout（24 小时级偶发无 runner），2027-04-17 才移除 | 迁到 **`ubuntu-24.04`**。同时避开 `ubuntu-latest` —— 它将在 2026-10-19~11-19 跳到 Ubuntu 26.04，那会是一次不受控的工具链突变 |
+| 34 | **换 runner 后 `libgmp3-dev` 成了 dummy 包** | 24.04(noble) 里 `libgmp3-dev` 只是「pulls in libgmp-dev」的兼容包 | 显式改写 `libgmp-dev`。其余依赖包已在 noble 逐一核实存在 |
+
+**本轮风险与验证**：这是本项目**第一次换 runner 镜像**（22.04→24.04），
+工具链版本会变（gcc/clang/python3 小版本），存在编译失败的可能。
+若失败，最快的回退方式是把 `runs-on` 改回 `ubuntu-22.04`（保留 v6 actions，
+v6 在 22.04 上同样能跑，只是 22.04 本身有 brownout 风险）。
+

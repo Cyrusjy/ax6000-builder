@@ -88,8 +88,10 @@ check_pkg() {
   fi
 }
 
-check_pkg smartdns
-check_pkg luci-app-smartdns
+# 说明：这里只查「配置里确实选了、且容易写错包名」的关键包。
+# smartdns / luci-app-smartdns 在第 6 版已按要求从配置中移除（DNS 交给
+# dnsmasq-full），所以不再列入检查 —— 列了只会长期输出误导性的 [WARN]。
+# libbpf1 同理不查：它是 ip-full 的依赖、自动带入，查了会误报。
 check_pkg luci-app-eqos-mtk
 check_pkg luci-app-mtwifi-cfg
 check_pkg luci-app-turboacc-mtk

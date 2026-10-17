@@ -40,34 +40,75 @@ on:
 permissions:
   contents: write
 
+# 防止连续两次推送并行跑两个 build：否则它们会往同一个 tag 发 Release、
+# 同时读写 ccache、还抢 runner 额度（顺带省一次 1.6 小时的白编）。
+# 新推送到了就让旧的那次取消，因为后推送的必然是最新意图。
+concurrency:
+  group: ax6000-build
+  cancel-in-progress: true
+
 env:
   TZ: Asia/Shanghai
   SOURCE_DIR: immortalwrt
   # ccache 目录由上游 rules.mk 固定在 $(TOPDIR)/.ccache，这里只限制它的大小，
-  # 免得单个缓存条目撑爆 GitHub 仓库 10GB 的缓存配额（会挤掉 dl/ 缓存）
-  CCACHE_MAXSIZE: 2G
+  # 免得单个缓存条目撑爆 GitHub 仓库 10GB 的缓存配额（会挤掉 dl/ 缓存）。
+  # 上限从 2G 降到 1G：run 8/9 实测只用了约 560MB，省下的空间留给 dl/
+  # （一份 1.8GB，必须保住，被 LRU 挤掉就要重下十几分钟）。
+  CCACHE_MAXSIZE: 1G
 
 jobs:
   build:
     name: Build (${{ github.event.inputs.profile || 'xiaomi_redmi-router-ax6000-mtkuboot' }})
-    runs-on: ubuntu-22.04
+    # runner 镜像说明（2026-10 定）：
+    #   ① 不用 ubuntu-latest：该 label 会在 2026-10-19 ~ 11-19 之间跳到
+    #      Ubuntu 26.04，届时是一次不受控的环境突变（工具链版本、apt 源都可能变）。
+    #      明确写 ubuntu-24.04，让下次镜像变更成为一个需要主动决策的动作。
+    #   ② 不用 ubuntu-22.04：该镜像 2026-09-17 已停止积极支持，deprecation 期间
+    #      有「brownout」临时不可用窗口（24 小时级的偶发无 runner），
+    #      2027-04-17 才完全移除。留着一个已知会随机抽风的镜像没有意义。
+    #   ③ ubuntu-24.04 的 runner 版本 ≥ 2.327.1，满足 actions/*@v6（Node 24）
+    #      的最低 runner 要求。
+    runs-on: ubuntu-24.04
     timeout-minutes: 355
 
     steps:
       # ------------------------------------------------------------------
       # 0. 释放磁盘空间：GitHub 免费 runner 只有 ~14GB 可用，
       #    OpenWrt 全量编译需要 25-35GB，这一步是必须的
+      #
+      #    2026-10 改动：原来用第三方 action jlumbroso/free-disk-space，
+      #    但该 action 已停止维护（2026-08 起无人维护，安全评分 F），
+      #    且它 hardcode 了一批「预装大件」的路径，runner 镜像一换就可能漏删。
+      #    改成内联 shell：只删我们确定用不到的东西，行为完全可控、可复现，
+      #    也不用再担心它哪天被投毒或悄悄失效。
+      #
+      #    清理目标（按实测占用量从大到小）：
+      #      /usr/share/dotnet        ~6GB   用不到
+      #      /usr/local/lib/android   ~8GB   用不到
+      #      /opt/ghc                 ~2GB   用不到
+      #      /usr/local/share/boost   ~1GB   用不到
+      #      /usr/share/swift         少量   用不到
+      #      apt 缓存 + journal       ~1GB
       # ------------------------------------------------------------------
       - name: 释放磁盘空间
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: false
-          swap-storage: false
+        run: |
+          echo "===== 清理前 ====="
+          df -h /
+          # 只删目录、不碰系统包数据库；每条都允许失败（目录不存在是正常的）
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /usr/share/swift || true
+          sudo rm -rf /usr/local/.ghcup || true
+          # CodeQL 的预装工具链也很占地方，编译不需要
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          # apt 缓存与日志
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+          sudo journalctl --vacuum-size=50M 2>/dev/null || true
+          echo "===== 清理后 ====="
+          df -h /
 
       - name: 显示可用空间
         run: df -h /
@@ -76,18 +117,22 @@ jobs:
       # 1. 检出本仓库（只放配置和脚本，不放源码）
       # ------------------------------------------------------------------
       - name: 检出编译器仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: builder
 
       - name: 安装编译依赖
         run: |
           sudo apt-get update -qq
+          # libgmp3-dev 在 24.04(noble) 里已变成「dummy package」，仅用于兼容，
+          # 真实包名是 libgmp-dev。这里显式写 libgmp-dev，避免依赖 dummy 过渡包。
+          # 其余包在 noble 均已核实存在（lib32gcc-s1 / libmpc-dev / libmpfr-dev /
+          # libc6-dev-i386 / ecj / fastjar / mkisofs / msmtp / lrzsz 等）。
           sudo apt-get install -y --no-install-recommends \
             ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
             bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex \
             g++ g++-multilib gawk gcc-multilib gettext git gperf haveged help2man intltool \
-            lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp-dev libltdl-dev \
             libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
             libtool libyaml-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip \
             p7zip-full patch pkgconf python3 python3-docutils python3-pip python3-ply \
@@ -149,23 +194,46 @@ jobs:
       #    （上游 rules.mk 第 354 行），不是 $HOME/.ccache ——
       #    路径写错会导致缓存永远是 0 字节。
       # ------------------------------------------------------------------
+      #    ⚠️ key 里【不要】带 hashFiles(config)：dl/ 里只是源码包压缩包，
+      #    跟 .config 一点关系都没有。带过的结果是 run 8 和 run 9 各存了一份
+      #    1.8GB 的 dl 缓存（合计 3.6GB / 10GB 配额），再过两三次就会触发
+      #    LRU，被挤掉的正好是最新那份 → 白下十几分钟。
+      #    同理 ccache 也不要带 run_number —— 那是每次必然新增 0.56GB。
+      #    这里改成「固定滚动 key」：命中就原地更新，永远只占一格。
+      # ------------------------------------------------------------------
       - name: 缓存源码包 dl/
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: immortalwrt/dl
-          key: dl-${{ steps.clone.outputs.sha }}-${{ hashFiles('builder/config/ax6000-mtkuboot.config') }}
+          # 只按上游源码 commit 区分：同一次源码，配置怎么改 dl 都一样
+          key: dl-${{ steps.clone.outputs.sha }}
+          # 上游 commit 变了但 dl 大部分相同，也能捞到相近的一份用
           restore-keys: |
-            dl-${{ steps.clone.outputs.sha }}-
             dl-
+          # cache-mode 必须显式写：v5 起不指定时默认值取决于触发类型
+          # （trusted→write / low-trust→read），依赖隐式默认不可靠。
+          # 我们这里是 push 触发，但显式写 write 才不会哪天换了触发方式就静默不保存。
+          cache-mode: write
 
-      - name: 缓存 ccache
-        uses: actions/cache@v4
+      # 注意：ccache 用 cache/restore + cache/save 两步而不是单个 cache step。
+      # 因为「固定 key + 单 step」在 restore 未命中时，cache@v4 的 post 步骤
+      # 不会产出缓存（只有完整 key 命中才更新）。拆开后 miss 也能存下来。
+      # v6 起 cache-mode 显式写，理由同上面 dl/ 那段。
+      - name: 恢复 ccache（滚动 key）
+        uses: actions/cache/restore@v6
         with:
           path: immortalwrt/.ccache
-          key: ccache-${{ steps.clone.outputs.sha }}-${{ github.run_number }}
+          key: ccache-${{ steps.clone.outputs.sha }}
           restore-keys: |
-            ccache-${{ steps.clone.outputs.sha }}-
             ccache-
+          cache-mode: read
+
+      - name: 保存 ccache
+        uses: actions/cache/save@v6
+        with:
+          path: immortalwrt/.ccache
+          key: ccache-${{ steps.clone.outputs.sha }}
+          cache-mode: write
 
       # ------------------------------------------------------------------
       # 4. feeds
@@ -294,36 +362,29 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           log ""
-          log "===== 用户要求的组件（包名已按 25.12 全树核实）====="
-          # 注意：luci-i18n-proto-wireguard-zh-cn **不存在** —— 上游 luci 的
-          # protocols/luci-proto-wireguard/ 下没有 po/ 目录，故没有中文语言包。
-          # 之前把它列在检查清单里，只会长期显示误导性的「未启用」。
-          # libbpf1 不在这里列：它是 ip-full 的依赖、自动带入，
-          # 显式列会因「未被用户直接选中」而误报为未启用（实测已入固件）。
-          for p in luci-app-eqos-mtk luci-i18n-eqos-mtk-zh-cn \
-                   luci-app-turboacc-mtk luci-app-mtwifi-cfg mtwifi-cfg-ucode \
-                   kmod-mt_wifi kmod-warp kmod-mediatek_hnat \
-                   kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal \
-                   kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag \
-                   ip-full kmod-dummy kmod-nft-socket \
-                   kmod-wireguard wireguard-tools luci-proto-wireguard \
-                   ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
-                   msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
-                   miniupnpd-nftables luci-app-upnp luci-i18n-upnp-zh-cn \
-                   vlmcsd luci-app-vlmcsd luci-i18n-vlmcsd-zh-cn \
-                   ttyd luci-app-ttyd luci-i18n-ttyd-zh-cn; do
-            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
-              log "  [y] $p"
-              echo "| \`$p\` | 已启用 |" >> "$GITHUB_STEP_SUMMARY"
-            else
-              log "  [ ] $p  (未选中 / 包名不存在)"
-              echo "| \`$p\` | 未启用 |" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
+          log "===== 用户要求的组件（清单由 .config 自动生成，不再手写）====="
+          # 旧版这里是手写 30 多个包名的 for 循环：加插件时要记得同步两处，
+          # 忘了就出现「配置里明明有、清单里却没显示」的漂移（ttyd 就是手工补的）。
+          # 现在直接从 .config 提取所有 CONFIG_PACKAGE_*=y，天然不会漂移。
+          #
+          # 注意：这份清单只反映「用户显式写了什么」，不等于「最终进了固件」。
+          # 依赖自动带入的包（如 libbpf1 ← ip-full、libwebsockets-full ← ttyd）
+          # 不会出现在这里，但它们确实在固件里 —— 别看到某包不在清单就以为没装，
+          # 权威判据始终是 .manifest（见后面「manifest 实测」段）。
+          grep -oE '^CONFIG_PACKAGE_[^=]+' .config | sed 's/^CONFIG_PACKAGE_//' | sort > /tmp/want.txt
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            log "  [y] $p"
+            echo "| \`$p\` | 已启用 |" >> "$GITHUB_STEP_SUMMARY"
+          done < /tmp/want.txt
+          log "  ---- 共 $(wc -l < /tmp/want.txt) 个包被显式选中（不含依赖自动带入）----"
 
           log ""
           log "===== 故意不编入（用户刷机后自行安装官方版本）====="
-          for p in sing-box luci-app-homeproxy luci-i18n-homeproxy-zh-cn; do
+          # momo 也一起查：momo 是 sing-box 的 LuCI 面板，与 sing-box 同属
+          # 「用户自装」策略，写在这里防止哪天手滑加进 .config。
+          for p in sing-box luci-app-homeproxy luci-i18n-homeproxy-zh-cn \
+                   momo luci-app-momo luci-i18n-momo-zh-cn; do
             if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
               log "  [!] $p  被编入了（预期是不选）"
               echo "| \`$p\` | ⚠️意外编入 |" >> "$GITHUB_STEP_SUMMARY"
@@ -485,6 +546,56 @@ jobs:
               grep -E '^\[|^  \[y\]|^  \[ \]|^CONFIG_PACKAGE_|^CONFIG_KERNEL_|^  ----|^=====' "$PRECHECK_FILE" || cat "$PRECHECK_FILE"
             fi
             echo
+            echo "===== manifest 实测（固件里到底有什么，权威判据）====="
+            # precheck 只反映「.config 里写了什么」，而且对依赖自动带入的包
+            # 会误报（libbpf1 ← ip-full 就被误报过一次）。manifest 是 OpenWrt
+            # 打包时生成的最终清单，才是「固件里真有什么」的唯一权威证据。
+            MAN="$(find bin/targets -name '*.manifest' -newer "$KCFG" 2>/dev/null | head -1)"
+            [ -n "$MAN" ] || MAN="$(find bin/targets -name '*.manifest' 2>/dev/null | head -1)"
+            if [ -n "$MAN" ]; then
+              echo "manifest 路径: $MAN"
+              echo "包总数: $(wc -l < "$MAN")"
+              echo
+              echo "---- 核心能力实测 ----"
+              # 这些是「配置里写了 → 必须真的在 manifest 里」的项；
+              # 缺任何一个都说明有东西被静默丢弃了。
+              for p in ttyd luci-app-ttyd luci-i18n-ttyd-zh-cn \
+                       kmod-mt_wifi kmod-warp kmod-mediatek_hnat \
+                       kmod-sched-bpf kmod-xdp-sockets-diag bpftool-minimal libbpf1 \
+                       kmod-wireguard wireguard-tools luci-proto-wireguard \
+                       kmod-nft-queue kmod-nfnetlink-queue kmod-netlink-diag \
+                       ip-full kmod-dummy kmod-nft-socket \
+                       miniupnpd-nftables luci-app-upnp \
+                       ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
+                       msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
+                       vlmcsd luci-app-vlmcsd luci-i18n-vlmcsd-zh-cn \
+                       luci-app-eqos-mtk luci-app-turboacc-mtk \
+                       luci-app-mtwifi-cfg luci-theme-argon; do
+                # manifest 格式是「包名 - 版本」，用前缀 + 分隔符精确匹配，
+                # 避免 luci-app-ttyd 命中 luci-app-ttyd-something 之类
+                if grep -qE "^${p} - " "$MAN"; then
+                  echo "  [y] $p"
+                else
+                  echo "  [ ] $p  ← 未进固件（依赖未满足或包名已变，需排查）"
+                fi
+              done
+              echo
+              echo "---- 应排除项实测（出现即异常）----"
+              for p in sing-box luci-app-homeproxy momo luci-app-momo \
+                       smartdns luci-app-smartdns ip-tiny sqm-scripts nlbwmon; do
+                if grep -qE "^${p} - " "$MAN"; then
+                  echo "  [!] $p  ← 意外进固件了（预期是不选）"
+                else
+                  echo "  [OK] $p 未进固件（符合预期）"
+                fi
+              done
+              echo
+              echo "---- LuCI 图形插件清单（manifest 中的 luci-app-*）----"
+              grep -E '^luci-app-[^ ]+ - ' "$MAN" | sed 's/ - .*//' | sort || true
+            else
+              echo "⚠️ 未找到 .manifest，跳过实测"
+            fi
+            echo
             echo "===== 产物清单 ====="
             ls -lh "$OUT" | grep -v -- 'build-info.txt' || true
           } > "$OUT/build-info.txt"
@@ -503,17 +614,47 @@ jobs:
           echo "OUT_DIR=$OUT" >> "$GITHUB_ENV"
           # 用 step 输出而不是 env，保证后续 with:/body: 里一定能取到值
           echo "date=${DATE}" >> "$GITHUB_OUTPUT"
-          echo "tag=ax6000-${DATE}-${SOURCE_COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+          # tag 必须带 run_number：否则「同一天 + 同一个上游 commit 编两次」
+          # 会得到同一个 tag，action-gh-release 会去【更新】已存在的 Release，
+          # 把上一版固件覆盖掉（第三次和第五次编译都撞过：都产出了
+          # ax6000-20261010-ae65e1d，后一次盖掉了前一次）。
+          # run_number 单调递增，一劳永逸。
+          echo "tag=ax6000-${DATE}-${SOURCE_COMMIT_SHORT}-r${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "commit=${SOURCE_COMMIT}" >> "$GITHUB_OUTPUT"
           echo "commit_short=${SOURCE_COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
           echo "profile=${PROFILE}" >> "$GITHUB_OUTPUT"
           echo "source_repo=${{ github.event.inputs.source_repo || 'chasey-dev/immortalwrt-mt798x-rebase' }}" >> "$GITHUB_OUTPUT"
           echo "source_ref=${{ github.event.inputs.source_ref || '25.12' }}" >> "$GITHUB_OUTPUT"
           echo "btf_note=${BTF_NOTE}" >> "$GITHUB_OUTPUT"
+
+          # 「预装」清单改为从 manifest 实测生成 —— 原来这里是硬编码的，
+          # 里面写着 smartdns，而 smartdns 早在第 6 版就按要求移除了，
+          # 等于每次发版都在 Release 页面上写一句假话。
+          PKG_NOTE="（未取得 manifest，详见附件 build-info.txt 的「manifest 实测」段）"
+          if [ -n "${MAN:-}" ] && [ -f "$MAN" ]; then
+            PKG_NOTE="$(mktemp)"
+            {
+              # 只列「用户能感知到的东西」，内核模块和库不算
+              for p in ttyd luci-app-ttyd kmod-wireguard wireguard-tools \
+                       ddns-go msd_lite vlmcsd miniupnpd-nftables \
+                       luci-app-eqos-mtk luci-app-turboacc-mtk luci-app-mtwifi-cfg; do
+                grep -qE "^${p} - " "$MAN" && printf '%s ' "$p"
+              done
+              echo
+            } | sed 's/ $//' > "$PKG_NOTE"
+            PKG_TOTAL="$(wc -l < "$MAN")"
+            PKG_NOTE="${PKG_NOTE:-（manifest 中未找到预期包）}"
+            echo "pkg_note=$(cat "$PKG_NOTE")" >> "$GITHUB_OUTPUT"
+            echo "pkg_total=${PKG_TOTAL}" >> "$GITHUB_OUTPUT"
+            echo "MANIFEST_PATH=$MAN" >> "$GITHUB_OUTPUT"
+          else
+            echo "pkg_note=${PKG_NOTE}" >> "$GITHUB_OUTPUT"
+            echo "pkg_total=unknown" >> "$GITHUB_OUTPUT"
+          fi
           du -sh "$OUT"
 
       - name: 上传固件为 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ax6000-${{ steps.prep.outputs.date }}-${{ steps.prep.outputs.profile }}
           path: out/
@@ -521,6 +662,7 @@ jobs:
           if-no-files-found: error
 
       - name: 发布 Release
+        # v2 是最终主版本（Node 20）；已钉死，避免上游主线漂移导致发布行为变化。
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.prep.outputs.tag }}
@@ -540,11 +682,20 @@ jobs:
 
             **内核状态**：${{ steps.prep.outputs.btf_note }}
 
-            预装：MTK 原厂闭源 WiFi 驱动（kmod-mt_wifi 7.6.7.3）、HNAT/WARP 硬件加速、
-            smartdns、eqos-mtk。
+            **固件包总数**：${{ steps.prep.outputs.pkg_total }}（来自 `.manifest` 实测，非配置推断）
+
+            预装（`.manifest` 实测确认）：MTK 原厂闭源 WiFi 驱动（`kmod-mt_wifi` 7.6.7.3）、
+            HNAT/WARP 硬件加速（`kmod-mediatek_hnat` / `kmod-warp`）、eBPF/BTF、
+            ${{ steps.prep.outputs.pkg_note }}
+
+            > 说明：`sing-box` / `momo` / `homeproxy` **按需不预装** —— 固件已预置它们的
+            > 全部内核模块依赖（`kmod-nft-queue` / `kmod-nfnetlink-queue` / `kmod-netlink-diag` /
+            > `ip-full` / `kmod-dummy`），刷机后自行安装官方版本即可。
+            > `smartdns` 也已按要求移除，DNS 走 `dnsmasq-full`。
 
             📎 附件里的 `build-info.txt` / `kernel-config.txt` / `precheck.txt`
-            是本次构建的完整证据（内核实测配置、包清单、编译前核对结果）。
+            是本次构建的完整证据（内核实测配置、manifest 实测清单、编译前核对结果）。
+            `build-info.txt` 里有「manifest 实测」段，逐项列出每个核心包是否真的进了固件。
 
             > ⚠️ 刷机有变砖风险。请务必刷与路由器当前 U-Boot 布局一致的镜像，
             > 首次刷机前建议备份原厂分区。详细步骤见仓库 README。

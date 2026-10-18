@@ -186,40 +186,46 @@ jobs:
           df -h /
 
       # ------------------------------------------------------------------
-      # 3. 缓存（dl 源码包 + ccache）
+      # 3. 缓存（dl 源码包 + ccache）—— 只做「恢复」，保存放到编译之后
       #
       #    ⚠️ 必须放在克隆之后：恢复缓存会创建 immortalwrt/ 目录，
       #    放在克隆前会让 git clone 以 exit 128 失败。
       #    ⚠️ ccache 目录是 $(TOPDIR)/.ccache，即 immortalwrt/.ccache
       #    （上游 rules.mk 第 354 行），不是 $HOME/.ccache ——
       #    路径写错会导致缓存永远是 0 字节。
+      #
+      #    ⚠️ key 必须带源码 commit，【不能】用纯固定名。原因：
+      #      GitHub 缓存是 immutable —— key 一旦写入就永远不能覆盖。
+      #      若用固定 key（如 dl-v1）：第 1 次保存后，第 2 次起每次命中
+      #      都「跳过保存」，内容永久冻结在第 1 次；而上游一更新包版本，
+      #      新包下下来了却存不进去，下次还得重下 —— 比带 sha 更糟。
+      #      带 sha 则「内容该变时 key 就变」，这才是缓存的正确用法。
+      #
+      #    ⚠️ 但带 sha 会累积旧条目（每个上游版本一份 1.7GB）。
+      #      而 restore-keys 里的宽前缀 dl- 每次运行都会「访问」旧条目，
+      #      把它们的 7 天过期计时器一直刷新 → 永远不自动删除。
+      #      实测 2026-10-18：8 条缓存 8.81GB / 10GB（88.1%），
+      #      其中 4 条是 10-10 和 10-14 的老版本，早该过期却还挂着。
+      #      → 解法不是改 key，而是【编译成功后主动清理非当前版本的缓存】，
+      #        见本文件后面的「清理旧版本缓存」步骤。这样稳态只有 2 条。
       # ------------------------------------------------------------------
-      #    ⚠️ key 里【不要】带 hashFiles(config)：dl/ 里只是源码包压缩包，
-      #    跟 .config 一点关系都没有。带过的结果是 run 8 和 run 9 各存了一份
-      #    1.8GB 的 dl 缓存（合计 3.6GB / 10GB 配额），再过两三次就会触发
-      #    LRU，被挤掉的正好是最新那份 → 白下十几分钟。
-      #    同理 ccache 也不要带 run_number —— 那是每次必然新增 0.56GB。
-      #    这里改成「固定滚动 key」：命中就原地更新，永远只占一格。
-      # ------------------------------------------------------------------
-      - name: 缓存源码包 dl/
-        uses: actions/cache@v6
+      - name: 恢复源码包 dl/
+        uses: actions/cache/restore@v6
         with:
           path: immortalwrt/dl
-          # 只按上游源码 commit 区分：同一次源码，配置怎么改 dl 都一样
           key: dl-${{ steps.clone.outputs.sha }}
-          # 上游 commit 变了但 dl 大部分相同，也能捞到相近的一份用
+          # 上游 commit 变了也捞一份相近的做暖启动（代价：会刷新旧条目寿命，
+          # 所以必须配合后面的主动清理，否则会无限累积）
           restore-keys: |
             dl-
           # cache-mode 必须显式写：v5 起不指定时默认值取决于触发类型
           # （trusted→write / low-trust→read），依赖隐式默认不可靠。
-          # 我们这里是 push 触发，但显式写 write 才不会哪天换了触发方式就静默不保存。
-          cache-mode: write
+          cache-mode: read
 
-      # 注意：ccache 用 cache/restore + cache/save 两步而不是单个 cache step。
-      # 因为「固定 key + 单 step」在 restore 未命中时，cache@v4 的 post 步骤
-      # 不会产出缓存（只有完整 key 命中才更新）。拆开后 miss 也能存下来。
-      # v6 起 cache-mode 显式写，理由同上面 dl/ 那段。
-      - name: 恢复 ccache（滚动 key）
+      # ccache 用 cache/restore + cache/save 两步而不是单个 cache step：
+      # 「固定 key + 单 step」在 restore 未命中时，post 步骤不会产出缓存
+      # （只有完整 key 命中才更新）。拆开后 miss 也能存下来。
+      - name: 恢复 ccache
         uses: actions/cache/restore@v6
         with:
           path: immortalwrt/.ccache
@@ -227,13 +233,6 @@ jobs:
           restore-keys: |
             ccache-
           cache-mode: read
-
-      - name: 保存 ccache
-        uses: actions/cache/save@v6
-        with:
-          path: immortalwrt/.ccache
-          key: ccache-${{ steps.clone.outputs.sha }}
-          cache-mode: write
 
       # ------------------------------------------------------------------
       # 4. feeds
@@ -652,6 +651,121 @@ jobs:
             echo "pkg_total=unknown" >> "$GITHUB_OUTPUT"
           fi
           du -sh "$OUT"
+
+      # ------------------------------------------------------------------
+      # ⚠️ 缓存保存【必须】放在编译之后
+      #
+      #    之前的错版把「保存 ccache」放在「恢复」之后、编译之前 ——
+      #    等于把**编译前**的缓存写回去，滚动更新完全失效：
+      #    每次都用上一次的旧内容覆盖，本次编译的成果永远存不进去。
+      #    （原来的问题只是「命中率低」，错版变成「永远停在原地」，更糟。）
+      #
+      #    放在这里的原因：此时 make 已跑完，ccache 里才有本次的真实命中产物。
+      #    dl/ 同理 —— 预下载和编译阶段补下的源码包都在里面了。
+      #
+      #    前置条件：必须 if: success()，编译失败时不要污染缓存。
+      # ------------------------------------------------------------------
+      - name: 保存源码包 dl/
+        if: success()
+        uses: actions/cache/save@v6
+        with:
+          path: immortalwrt/dl
+          key: dl-${{ steps.clone.outputs.sha }}
+          cache-mode: write
+
+      - name: 保存 ccache
+        if: success()
+        uses: actions/cache/save@v6
+        with:
+          path: immortalwrt/.ccache
+          key: ccache-${{ steps.clone.outputs.sha }}
+          cache-mode: write
+
+      # ------------------------------------------------------------------
+      # 清理旧版本缓存 —— 这是「缓存配额不失控」的关键一步
+      #
+      #    背景：key 带 sha 才能正确表达「内容变了」，但上游每更新一次就多一份
+      #    1.7GB 的 dl 缓存。而 restore-keys 的宽前缀 dl- 每次运行都会「访问」
+      #    旧条目，把 7 天过期计时器一直刷新 → 永远不会自动删除。
+      #    实测 2026-10-18：8 条 / 8.81GB（88.1%），其中 4 条来自 10-10 和 10-14。
+      #
+      #    做法：编译成功后，列出所有 dl-*/ccache-* 缓存，保留当前 sha 的那条，
+      #    其余全部 DELETE 掉。稳态回到 2 条（约 2.3GB / 23%）。
+      #
+      #    安全性：只删「不是本次运行要用的」缓存条目，不碰代码、不碰 Release。
+      #    DELETE 失败不影响构建（|| true），最多是配额暂时没降下来。
+      # ------------------------------------------------------------------
+      - name: 清理旧版本缓存
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_SHA: ${{ steps.clone.outputs.sha }}
+        run: |
+          # 注意：本步骤刻意【不加】set -e。清理是「尽力而为」的附加动作，
+          # 任何一条 API 调用失败都不应该让整个构建失败（缓存没清掉只是配额
+          # 暂时不降，下次还会再试）。若加 set -e，一次 502 就会让构建红掉。
+          echo "保留本次使用的版本: ${KEEP_SHA}"
+          echo
+          page=1
+          deleted=0
+          kept=0
+          while : ; do
+            resp="$(curl -sS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100&page=${page}" || true)"
+
+            # 解析出 id 和 key（每行 "<id> <key>"）
+            rows="$(printf '%s' "$resp" \
+              | grep -oE '"id":[0-9]+,"ref":"[^"]*","key":"[^"]*"' \
+              | sed -E 's/.*"id":([0-9]+).*"key":"([^"]*)".*/\1 \2/' || true)"
+
+            # 空响应（网络失败 / 凭据问题 / 无缓存）→ 安全退出，绝不误删
+            [ -n "$rows" ] || { echo "  （无可解析的缓存条目，跳过）"; break; }
+
+            while read -r cid ckey; do
+              [ -n "$cid" ] || continue
+              case "$ckey" in
+                dl-*|ccache-*)
+                  case "$ckey" in
+                    "dl-${KEEP_SHA}"|"ccache-${KEEP_SHA}")
+                      echo "  保留: $ckey"
+                      kept=$((kept+1))
+                      continue
+                      ;;
+                  esac
+                  echo "  删除: $ckey (id=$cid)"
+                  code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+                       -H "Authorization: Bearer ${GH_TOKEN}" \
+                       -H "Accept: application/vnd.github+json" \
+                       "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches/${cid}" \
+                       || echo "000")"
+                  case "$code" in
+                    200|204) deleted=$((deleted+1)) ;;
+                    *) echo "    ⚠️ 删除失败 (HTTP $code)，不影响构建" ;;
+                  esac
+                  ;;
+              esac
+            done <<< "$rows"
+
+            cnt="$(printf '%s' "$resp" | grep -oE '"id":[0-9]+,"ref"' | wc -l || echo 0)"
+            [ "$cnt" -lt 100 ] && break
+            page=$((page+1))
+          done
+
+          echo
+          echo "===== 清理结果 ====="
+          echo "  保留 $kept 条，删除 $deleted 条"
+          echo "===== 清理后配额 ====="
+          curl -sS \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches" \
+            | grep -oE '"size_in_bytes":[0-9]+' \
+            | sed 's/"size_in_bytes"://' \
+            | awk '{s+=$1} END {if (NR>0) printf "  合计 %.2f GB / 10 GB (%.1f%%)\n", s/1073741824, s/10737418240; else print "  （无缓存）"}' \
+            || true
+          echo "✅ 清理步骤结束（本步骤永不失败）"
 
       - name: 上传固件为 artifact
         uses: actions/upload-artifact@v6

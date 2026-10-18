@@ -39,6 +39,13 @@ on:
 
 permissions:
   contents: write
+  # ⚠️ 必须显式给 actions: write —— 否则「清理旧版本缓存」步骤会静默失效。
+  #    GitHub 规则：一旦写了 permissions 块，未列出的权限全部降为 none。
+  #    实测 run #11：只给 contents: write 时，GITHUB_TOKEN 调
+  #    GET /repos/{o}/{r}/actions/caches 返回 403 → 解析为空 → 脚本走
+  #    「跳过」分支 → 该步骤 0 秒结束、success，一条缓存都没删。
+  #    （诊断依据：第 21 步 started_at == completed_at，0 秒）
+  actions: write
 
 # 防止连续两次推送并行跑两个 build：否则它们会往同一个 tag 发 Release、
 # 同时读写 ccache、还抢 runner 额度（顺带省一次 1.6 小时的白编）。
@@ -218,9 +225,6 @@ jobs:
           # 所以必须配合后面的主动清理，否则会无限累积）
           restore-keys: |
             dl-
-          # cache-mode 必须显式写：v5 起不指定时默认值取决于触发类型
-          # （trusted→write / low-trust→read），依赖隐式默认不可靠。
-          cache-mode: read
 
       # ccache 用 cache/restore + cache/save 两步而不是单个 cache step：
       # 「固定 key + 单 step」在 restore 未命中时，post 步骤不会产出缓存
@@ -232,7 +236,6 @@ jobs:
           key: ccache-${{ steps.clone.outputs.sha }}
           restore-keys: |
             ccache-
-          cache-mode: read
 
       # ------------------------------------------------------------------
       # 4. feeds
@@ -671,7 +674,6 @@ jobs:
         with:
           path: immortalwrt/dl
           key: dl-${{ steps.clone.outputs.sha }}
-          cache-mode: write
 
       - name: 保存 ccache
         if: success()
@@ -679,7 +681,6 @@ jobs:
         with:
           path: immortalwrt/.ccache
           key: ccache-${{ steps.clone.outputs.sha }}
-          cache-mode: write
 
       # ------------------------------------------------------------------
       # 清理旧版本缓存 —— 这是「缓存配额不失控」的关键一步
@@ -704,27 +705,52 @@ jobs:
           # 注意：本步骤刻意【不加】set -e。清理是「尽力而为」的附加动作，
           # 任何一条 API 调用失败都不应该让整个构建失败（缓存没清掉只是配额
           # 暂时不降，下次还会再试）。若加 set -e，一次 502 就会让构建红掉。
+          #
+          # ⚠️ 但「尽力而为」不等于「静默失败」——
+          #    run #11 的教训：permissions 缺 actions: write，API 返回 403，
+          #    脚本按「空响应」安全跳过，该步骤 0 秒 success，一条缓存都没删，
+          #    而界面上完全看不出问题。所以这里必须把「拿不到数据」和
+          #    「真的没有缓存」区分开，前者要显式报警。
           echo "保留本次使用的版本: ${KEEP_SHA}"
           echo
           page=1
           deleted=0
           kept=0
+          total_seen=0
+          api_failed=0
           while : ; do
-            resp="$(curl -sS \
+            resp="$(curl -sS -w '\n__HTTP__%{http_code}' \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100&page=${page}" || true)"
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100&page=${page}" || echo '__HTTP__000')"
+
+            http="$(printf '%s' "$resp" | sed -n 's/.*__HTTP__\([0-9]*\)$/\1/p')"
+            body="$(printf '%s' "$resp" | sed 's/__HTTP__[0-9]*$//')"
+            echo "  API GET caches page=${page} -> HTTP ${http:-?}"
+
+            if [ "${http:-000}" != "200" ]; then
+              echo "::warning::缓存 API 返回 HTTP ${http}，清理步骤无法工作。"
+              echo "::warning::最常见原因：workflow 的 permissions 缺少 actions: write。"
+              echo "::warning::本次不清理（安全跳过），缓存配额将维持现状。"
+              api_failed=1
+              break
+            fi
 
             # 解析出 id 和 key（每行 "<id> <key>"）
-            rows="$(printf '%s' "$resp" \
+            rows="$(printf '%s' "$body" \
               | grep -oE '"id":[0-9]+,"ref":"[^"]*","key":"[^"]*"' \
               | sed -E 's/.*"id":([0-9]+).*"key":"([^"]*)".*/\1 \2/' || true)"
 
-            # 空响应（网络失败 / 凭据问题 / 无缓存）→ 安全退出，绝不误删
-            [ -n "$rows" ] || { echo "  （无可解析的缓存条目，跳过）"; break; }
+            if [ -z "$rows" ]; then
+              # HTTP 200 但解析不出条目 → 可能真的没有缓存，也可能格式变了
+              echo "  HTTP 200 但未解析出条目（total_count 见下）"
+              echo "$body" | grep -oE '"total_count":[0-9]+' || true
+              break
+            fi
 
             while read -r cid ckey; do
               [ -n "$cid" ] || continue
+              total_seen=$((total_seen+1))
               case "$ckey" in
                 dl-*|ccache-*)
                   case "$ckey" in
@@ -742,29 +768,39 @@ jobs:
                        || echo "000")"
                   case "$code" in
                     200|204) deleted=$((deleted+1)) ;;
-                    *) echo "    ⚠️ 删除失败 (HTTP $code)，不影响构建" ;;
+                    *)
+                      echo "    ⚠️ 删除失败 (HTTP $code)"
+                      echo "::warning::删除缓存 ${ckey} 失败，HTTP ${code}"
+                      ;;
                   esac
                   ;;
               esac
             done <<< "$rows"
 
-            cnt="$(printf '%s' "$resp" | grep -oE '"id":[0-9]+,"ref"' | wc -l || echo 0)"
+            cnt="$(printf '%s' "$body" | grep -oE '"id":[0-9]+,"ref"' | wc -l || echo 0)"
             [ "$cnt" -lt 100 ] && break
             page=$((page+1))
           done
 
           echo
           echo "===== 清理结果 ====="
-          echo "  保留 $kept 条，删除 $deleted 条"
+          echo "  扫描条目 $total_seen 条，保留 $kept 条，删除 $deleted 条"
+          if [ "$api_failed" = "1" ]; then
+            echo "  ❌ 因 API 权限/网络问题未能清理（见上面的 ::warning::）"
+          elif [ "$total_seen" = "0" ]; then
+            echo "  ⚠️ 扫描到 0 条缓存 —— 若确实应该有缓存，说明解析或权限有问题"
+          fi
           echo "===== 清理后配额 ====="
-          curl -sS \
+          curl -sS -w '\n__HTTP__%{http_code}' \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches" \
+            | sed 's/__HTTP__[0-9]*$//' \
             | grep -oE '"size_in_bytes":[0-9]+' \
             | sed 's/"size_in_bytes"://' \
-            | awk '{s+=$1} END {if (NR>0) printf "  合计 %.2f GB / 10 GB (%.1f%%)\n", s/1073741824, s/10737418240; else print "  （无缓存）"}' \
+            | awk '{s+=$1} END {if (NR>0) printf "  合计 %.2f GB / 10 GB (%.1f%%)\n", s/1073741824, s/10737418240; else print "  （读取失败或无缓存）"}' \
             || true
+          # 本步骤永不失败：清理是附加动作，失败只报警不影响固件产出
           echo "✅ 清理步骤结束（本步骤永不失败）"
 
       - name: 上传固件为 artifact

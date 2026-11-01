@@ -374,7 +374,7 @@ run 8 即上面 #13–19 那批修复的实编验证；run 9 追加 ttyd。
 | # | 问题 | 机理 / 证据 | 修复 |
 | --- | --- | --- | --- |
 | 30 | **`actions/*@v4` 已被强制跑在 Node 20→24 兼容层** | 每次 run 都刷一条 warning：`Node.js 20 is deprecated ... actions/cache@v4, actions/checkout@v4, actions/upload-artifact@v4, softprops/action-gh-release@v2` | 全部升到 **v6**（checkout / cache / cache/restore / cache/save / upload-artifact）。选 v6 而非 v5：两者同为 Node 24 运行时，但 v6 是主线且 `cache-mode` 语义文档最明确 |
-| 31 | **v5/v6 起 `cache-mode` 默认值取决于触发类型** | [GitHub Changelog 2026-09-10](https://github.blog/changelog/2026-09-10-control-github-actions-cache-access-with-cache-mode/)：不显式指定时，trusted 事件默认 `write`、low-trust 默认 `read`。依赖隐式默认不可靠 —— 哪天把触发方式从 `push` 改成 `pull_request`，缓存就会**静默不再保存** | 三个缓存 step 全部**显式写 `cache-mode`**（dl 和 save 用 `write`，restore 用 `read`） |
+| 31 | ~~**v5/v6 起 `cache-mode` 默认值取决于触发类型**~~ | **【已作废，见 #36】** 这条判断是错的：`cache-mode` 是 GitHub **平台级**的缓存访问策略（仓库/企业设置里配），**不是 `actions/cache` 的 action 输入参数**。查文档时混淆了这两层 | 见 #36 |
 | 32 | **`jlumbroso/free-disk-space@main` 用浮动 ref，且该 action 已废弃** | 2026-08-30 起无人维护（安全评分 F），README 示例里甚至已出现 `@v2` 而我们用 `@main`；它 hardcode 的「预装大件」路径随 runner 镜像更新会漏删 | **改为内联 shell 清理**：显式删 `/usr/share/dotnet`(~6GB) `/usr/local/lib/android`(~8GB) `/opt/ghc`(~2GB) `/usr/local/share/boost` / `/usr/share/swift` `/opt/hostedtoolcache/CodeQL` + apt 缓存与 journal。不依赖第三方、行为可控可复现 |
 | 33 | **`runs-on: ubuntu-22.04` 已停止积极支持** | [runner-images#14254](https://github.com/actions/runner-images/issues/14254)：2026-09-17 起 deprecated，deprecation 期间有 brownout（24 小时级偶发无 runner），2027-04-17 才移除 | 迁到 **`ubuntu-24.04`**。同时避开 `ubuntu-latest` —— 它将在 2026-10-19~11-19 跳到 Ubuntu 26.04，那会是一次不受控的工具链突变 |
 | 34 | **换 runner 后 `libgmp3-dev` 成了 dummy 包** | 24.04(noble) 里 `libgmp3-dev` 只是「pulls in libgmp-dev」的兼容包 | 显式改写 `libgmp-dev`。其余依赖包已在 noble 逐一核实存在 |
@@ -383,4 +383,100 @@ run 8 即上面 #13–19 那批修复的实编验证；run 9 追加 ttyd。
 工具链版本会变（gcc/clang/python3 小版本），存在编译失败的可能。
 若失败，最快的回退方式是把 `runs-on` 改回 `ubuntu-22.04`（保留 v6 actions，
 v6 在 22.04 上同样能跑，只是 22.04 本身有 brownout 风险）。
+
+**实测结果（run #10）**：runner 迁移完全成功，总耗时 **67 分钟**（史上最快），
+24 步全绿，`actions v6` 与 `ubuntu-24.04` 组合无任何问题。
+
+---
+
+### 2026-10-18 缓存机制的三轮翻车与修复（run #11 → #12）
+
+这一段是本项目**最值得记住的教训**：连续三轮编译，三次都因为「缓存」相关的原因
+出问题，而且**全部是静默失败** —— 界面上显示 success，实际什么都没做。
+
+#### 第一轮（run #11）：ccache 保存时机错误（自己引入的 bug）
+
+| # | 问题 | 机理 | 修复 |
+| --- | --- | --- | --- |
+| 35 | **「保存 ccache」被放在「恢复」之后、编译之前** | 拆分 `cache` 单 step 为 `restore`/`save` 两步时，只顾着拆开，忘了 `save` 必须在**编译之后**。等于把**编译前**的空缓存写回去，滚动更新完全失效 —— 比原来的「命中率低」更糟，变成「永远停在原地」 | 保存步骤整体移到「整理产物」之后、上传 artifact 之前，两个保存步骤都加 `if: success()`（编译失败不污染缓存） |
+
+#### 第二轮（run #12）：权限缺失导致清理步骤静默失效
+
+| # | 问题 | 机理 | 修复 |
+| --- | --- | --- | --- |
+| 36 | **`cache-mode` 不是 `actions/cache` 的输入参数** | GitHub 给出的警告很直白：`Unexpected input(s) 'cache-mode', valid inputs are ['path','key','upload-chunk-size','enableCrossOsArchive']`（save）/ `['path','key','restore-keys',...]`（restore）。`cache-mode` 是**平台级**的缓存访问策略（仓库设置里配），不是 action 输入。上一轮查文档时把这两层混淆了，写了 4 处无效配置 | 全部删除（5 处 → 0 处）。**#31 的判断因此作废** |
+| 37 | **`permissions` 缺 `actions: write`，清理步骤 403 静默跳过** | GitHub 规则：**一旦写了 `permissions` 块，未列出的权限全部降为 `none`**。原来只有 `contents: write` → `GITHUB_TOKEN` 调 `GET /repos/{o}/{r}/actions/caches` 返回 403 → 脚本按「空响应」安全跳过 → **第 21 步耗时 0 秒、conclusion=success，却一条缓存都没删**。界面上完全看不出问题，只有对比缓存实际数量才发现 | `permissions` 补 `actions: write` |
+| 38 | **「安全跳过」没有区分「真的没有缓存」和「没权限看」** | 两者在脚本眼里长得一样，都是空响应，所以静默失败。这是 #37 能藏住的原因 | 用 `curl -w` 捕获 HTTP 状态码：`HTTP != 200` → `::warning::` 报警并**明确提示「permissions 缺 actions: write」**；`HTTP == 200` 但解析为空 → 提示「扫描 0 条，需检查」。仍是「本步骤永不失败」（清理是附加动作，不该让固件产出红掉），但**失败一定会在 Actions 页面留下 warning 注解** |
+
+#### 第三轮（手工清理）：治标
+
+在修复推送之前，先用 API 直接删除 6 条旧缓存：**8 条 / 8.81 GB / 88.1% → 2 条 / 2.24 GB / 22.4%**，
+释放 6.57 GB。这样即使修复还有问题，配额也不会告急。
+
+#### 关键结论
+
+1. **GitHub Actions 缓存是 immutable** —— key 一旦写入就永远不能覆盖。
+   用固定 key（如 `dl-v1`）会导致：第 1 次保存后，第 2 次起每次命中都「跳过保存」，
+   内容**永久冻结在第 1 次**；且因为每次都被访问，7 天过期规则永不触发。
+   带 sha 才是正确用法（「内容该变时 key 就变」）。
+2. **key 带 sha 会累积旧条目**，而 `restore-keys` 的宽前缀每次运行都会「访问」旧条目，
+   把 7 天过期计时器一直刷新 → 永远不自动删除。
+   所以解法不是改 key，而是**编译成功后主动清理非当前版本的缓存**（#38）。
+3. **「刻意不失败」的步骤更要会报警**。清理失败只该是 warning，不是静默成功 ——
+   否则你只能靠事后数缓存条数才发现问题（这次就是）。
+
+#### 遗留（已确认待办）
+
+- **缓存 DELETE 分支尚未被真正验证过**：run #12 时缓存里只有当前版本的两条，
+  没有可删的，所以没走到 DELETE。需等上游 commit 变化后第一次编译才能确认。
+  （截至 2026-10-22，上游 `25.12` 分支仍停在 `03eb306`，未产生新缓存。）
+- `softprops/action-gh-release@v2` 仍跑在 Node 20，每次 run 一条弃用 warning。
+  它是最终主版本且仍在维护，暂无 v3，暂不处理。
+
+---
+
+### 2026-10-18 ~ 10-22 收尾
+
+- **run #12**：全绿，86 分钟，Release `ax6000-20261018-03eb306-r12`，
+  manifest **300 包**，BTF ✅，sysupgrade 23.65 MB。
+  固件已下载到桌面 `ax6000-firmware-r12/`（sysupgrade + initramfs + sha256sums），
+  两个镜像 SHA256 均与官方 `sha256sums` 逐字节一致。
+- **GitHub token 泄露事件**：诊断凭据时，一条命令把 `GITHUB_TOKEN` 明文打进了会话日志。
+  已由用户在 2026-10-22 撤销（`cmdkey /list` 确认凭据管理器中已无 github.com 条目）。
+  **教训**：验证凭据状态要用只读接口（`cmdkey /list`），
+  **不要用 `git credential fill`** —— 后者会触发 GCM 重新登录，
+  等于把刚撤销的凭据又要回来。
+- **token 撤销后的影响**：Agent 无法再代推。后续要改仓库并编译，
+  需重新授权（GCM 弹浏览器）或由用户双击工作区根目录的 `push-to-github.bat`。
+
+---
+
+### 2026-11-01 增补 kmod-veth（装 dae 的前置条件）
+
+用户刷机后要在固件上装 dae（daeuniverse）。dae 2.x 把代理逻辑放在独立的
+network namespace 里跑，需要一对 veth 把 LAN 流量接进 ns —— **没有 `veth.ko`
+它连启动都做不到**（建接口失败）。这一版只做一件事：把 veth 提前编进固件。
+
+| # | 改动 | 理由与核实方式 |
+| --- | --- | --- |
+| 39 | `config/ax6000-mtkuboot.config` 新增 `CONFIG_PACKAGE_kmod-veth=y` | 包名已核实：定义在 `package/kernel/linux/modules/netsupport.mk:522` 的 `KernelPackage/veth`，`KCONFIG:=CONFIG_VETH`，产出 `drivers/net/veth.ko`，`AUTOLOAD:=$(call AutoLoad,30,veth)`，**无 `DEPENDS`** |
+
+**为什么不在 `netdevices.mk`**：`kmod-dummy` / `kmod-ifb` 在 `netdevices.mk`，
+但 veth 和 `kmod-tun` 一起放在 `netsupport.mk`。按文件名猜会找错地方 ——
+这次是把 `modules/*.mk` 逐个 grep 过，只有 `netsupport.mk` 存在 `KernelPackage/veth`。
+
+**dae 那边还差什么**：daeuniverse 的 apk 源（`https://openwrt.daeuniverse.org/25.12/`）
+里 `kmods/25.12.6/mediatek/filogic/` 只有一个 `vmlinux-btf-6.12.112-r1.apk`，
+那是给**没有内置 BTF** 的内核补 `/sys/kernel/btf/vmlinux` 用的数据包。
+本固件 `CONFIG_KERNEL_DEBUG_INFO_BTF=y`（run #12 实测 BTF ✅），**不需要装**。
+所以内核侧唯一缺的就是 veth。
+
+**顺带记住的教训**：第三方 feed 的路径要按它自己的命名来。
+daeuniverse 用的是 `25.12`，不是 OpenWrt 的 `25.12-SNAPSHOT`；写错就是
+404 → `wget: exited with error 8` → `unexpected end of file`，
+而报错里出现的却是镜像域名，很容易误判成「镜像挂了」。
+
+**这一版的预期**：dl / ccache 的 key 是 `dl-<上游短 sha>` / `ccache-<上游短 sha>`，
+不含配置 hash，所以这次仍能命中缓存，预计 **40–70 分钟**；
+产物应比 r12 多一个 `kmod-veth`（manifest 300 → 301）。
 
